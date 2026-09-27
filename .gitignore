@@ -1,0 +1,17 @@
+# the VM: disk image, SSH private key and the cloud-init file with the password
+_vm/
+# third-party projects: fetched by tools/get_third_party.sh at pinned commits
+third_party/
+# papers are copyrighted; they are cited in the report
+papers_new/
+# the instructor's slides
+First Test.pptx
+# local build / cache files
+__pycache__/
+*.pyc
+.DS_Store
+~$*
+tools/node_modules/
+tools/build_doc.js
+q4_sim/go2_field_scene.xml
+MUJOCO_LOG.TXT

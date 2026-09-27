@@ -1,0 +1,2 @@
+1790470675.642659 [1]    python3: selected interface "lo" is not multicast-capable: disabling multicast
+recorded 9932 lowstate messages in 20.1 s (495 Hz) -> /home/harry/q2_logs/lowstate.csv

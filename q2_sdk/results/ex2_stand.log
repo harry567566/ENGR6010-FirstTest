@@ -1,0 +1,3 @@
+WARNING: Please ensure there are no obstacles around the robot while running this example.
+1790470680.642405 [1]    python3: selected interface "lo" is not multicast-capable: disabling multicast
+Done!
