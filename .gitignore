@@ -15,3 +15,9 @@ tools/node_modules/
 tools/build_doc.js
 q4_sim/go2_field_scene.xml
 MUJOCO_LOG.TXT
+.venv_robot/
+.venv_wifi/
+lab/.go2_aes_key
+lab/.go2_wifi_ip
+# photos, recordings and panel logs from the lab
+lab/data/

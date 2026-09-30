@@ -52,6 +52,12 @@ def main():
     a = ap.parse_args()
     sim = Go2Sim(mode="highlevel", render=a.view)
     m, d = sim.model, sim.data
+    if a.view:
+        # follow the dog, otherwise it walks out of Go2Py's fixed camera in a few seconds
+        with sim.viewer.lock():
+            sim.viewer.cam.type = mujoco.mjtCamera.mjCAMERA_TRACKING
+            sim.viewer.cam.trackbodyid = m.body("base").id
+            sim.viewer.cam.distance, sim.viewer.cam.azimuth, sim.viewer.cam.elevation = 2.2, 140, -20
     os.makedirs(os.path.join(HERE, "results"), exist_ok=True)
     writer = rend = None
     if not a.view:
@@ -66,11 +72,13 @@ def main():
     log, stills = [], {}
     n = int(DURATION / sim.dt)
     t0 = time.time()
-    for k in range(n):
-        t = k * sim.dt
+    k = -1
+    while k + 1 < n or a.view:          # in the live window the route repeats until it is closed
+        k += 1
+        t = (k * sim.dt) % DURATION
         vx, vy, wz = cmd_at(t)
         sim.step(vx, vy, wz)
-        if k % 10 == 0:
+        if k % 10 == 0 and not a.view:
             v = sim.getLinVel().ravel()
             pos, _ = sim.getPose()
             log.append((t, vx, vy, wz, v[0], v[1], d.qvel[5], pos[0], pos[1], pos[2]))

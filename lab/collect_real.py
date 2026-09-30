@@ -10,14 +10,16 @@ of record (without depth or segmentation, which a real camera does not give):
                        foot forces, IMU, battery; plus the body velocity and
                        height estimated by the robot (rt/sportmodestate)
 
-Run it in the Ubuntu VM with the robot connected over Ethernet:
-    python3 collect_real.py enp0s2 --secs 30 --fps 5
-The first argument is the VM network interface that is bridged to the robot.
+Run it with the robot connected over Ethernet, on the Mac or in the Ubuntu VM:
+    .venv_robot/bin/python lab/collect_real.py en7 --secs 30 --fps 5    (Mac)
+    python3 collect_real.py enp0s2 --secs 30 --fps 5                    (VM)
+The first argument is the network card that is on 192.168.123.x.
 While it records, someone can walk the dog with the remote control.
 """
 import argparse
 import csv
 import os
+import signal
 import threading
 import time
 
@@ -27,6 +29,11 @@ from unitree_sdk2py.idl.unitree_go.msg.dds_ import LowState_, SportModeState_
 
 JOINTS = ["FR_hip", "FR_thigh", "FR_calf", "FL_hip", "FL_thigh", "FL_calf",
           "RR_hip", "RR_thigh", "RR_calf", "RL_hip", "RL_thigh", "RL_calf"]
+
+
+def _terminated(signum, frame):
+    # the panel's time limit sends SIGTERM: treat it like Ctrl+C
+    raise KeyboardInterrupt
 
 
 def main():
@@ -66,20 +73,25 @@ def main():
     cam.SetTimeout(3.0)
     cam.Init()
 
+    # a time limit or Ctrl+C ends the recording early, but what was recorded is still saved below
+    signal.signal(signal.SIGTERM, _terminated)
     frames, t_end, k = [], time.time() + a.secs, 0
     print(f"recording {a.secs:.0f} s into {out} (the robot will not be commanded)")
-    while time.time() < t_end:
-        t0 = time.time()
-        code, data = cam.GetImageSample()
-        if code == 0:
-            name = f"frame_{k:04d}.jpg"
-            with open(os.path.join(out, name), "wb") as f:
-                f.write(bytes(data))
-            frames.append((name, f"{t0:.4f}"))
-            k += 1
-        else:
-            print("camera error code", code)
-        time.sleep(max(0.0, 1.0 / a.fps - (time.time() - t0)))
+    try:
+        while time.time() < t_end:
+            t0 = time.time()
+            code, data = cam.GetImageSample()
+            if code == 0:
+                name = f"frame_{k:04d}.jpg"
+                with open(os.path.join(out, name), "wb") as f:
+                    f.write(bytes(data))
+                frames.append((name, f"{t0:.4f}"))
+                k += 1
+            else:
+                print("camera error code", code)
+            time.sleep(max(0.0, 1.0 / a.fps - (time.time() - t0)))
+    except KeyboardInterrupt:
+        print("stopped early; saving what was recorded")
 
     with open(os.path.join(out, "frames.csv"), "w", newline="") as f:
         w = csv.writer(f)

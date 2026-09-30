@@ -15,6 +15,7 @@ The two agree only while the robot faces +x.
 
     python rl_gym_go2_sim.py                  both versions, video + figure
     mjpython rl_gym_go2_sim.py --view         watch it live (body-frame version)
+    mjpython rl_gym_go2_sim.py --view --frame world    watch the original version fall
 """
 import argparse
 import os
@@ -84,11 +85,18 @@ def run(frame="body", video=None, view=False):
         cam.distance, cam.azimuth, cam.elevation = 2.0, 135, -20
         writer = cv2.VideoWriter(video, cv2.VideoWriter_fourcc(*"mp4v"), 30, (720, 480))
     viewer = mujoco.viewer.launch_passive(m, d) if view else None
+    if viewer is not None:              # follow the dog in the live window
+        with viewer.lock():
+            viewer.cam.type = mujoco.mjtCamera.mjCAMERA_TRACKING
+            viewer.cam.trackbodyid = 1
+            viewer.cam.distance, viewer.cam.azimuth, viewer.cam.elevation = 2.0, 135, -20
 
     log = []
     n = int(DURATION / m.opt.timestep)
-    for k in range(n):
-        t = k * m.opt.timestep
+    k = -1
+    while k + 1 < n or viewer is not None:   # the live window repeats the route until closed
+        k += 1
+        t = (k * m.opt.timestep) % DURATION
         cmd, _ = cmd_at(t)
         d.ctrl[:] = pd_control(target, d.qpos[7:], kps, np.zeros_like(kds), d.qvel[6:], kds)
         mujoco.mj_step(m, d)
@@ -145,10 +153,12 @@ def score(log):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--view", action="store_true", help="live window (run with mjpython on macOS)")
+    ap.add_argument("--frame", choices=["body", "world"], default="body",
+                    help="live window only: 'world' repeats deploy_go2.py's mistake, the dog falls when it turns")
     a = ap.parse_args()
     if a.view:
         import mujoco.viewer  # noqa: F401
-        run("body", view=True)
+        run(a.frame, view=True)
         return
     os.makedirs(os.path.join(HERE, "results"), exist_ok=True)
     logs = {}

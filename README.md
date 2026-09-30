@@ -14,8 +14,9 @@ ENGR 6010 AI in Robotics, Dr. Hongbo Zhang.
 | `q2_sdk/` | 2 | VM setup script, the three SDK examples changed for the simulator, logs, screenshots |
 | `q3_go2py/` | 3 | Go2Py walking demo and its results |
 | `q4_sim/` | 4 | synthetic data recorder, true optical flow, the five-method pipeline, the unitree_rl_gym Go2 run |
-| `lab/` | 2, 4 | what to run on the real robot: checklist, read-only data collector, network script |
-| `tools/` | – | fetches the third-party projects; builds the report |
+| `lab/` | 2, 4 | the real robot, by Ethernet cable (`real_*.py`, official SDK) or by Wi-Fi (`wifi_*.py`, WebRTC): checklist, network setup, state, photo, data recorder, sport commands |
+| `control_panel.py` | all | one window with a button for every step: the real robot by cable or Wi-Fi, the Q2 simulator, Q3 and Q4 |
+| `tools/` | – | fetches the third-party projects; builds the report; starts and stops the VM; makes the desktop app |
 
 ## Setup (Mac, Apple Silicon)
 
@@ -70,9 +71,18 @@ Recording again gives slightly different frames, because Go2Py's controller adds
 
 Also on the way: UTM did not insert the cloud-init CD, and `hdiutil -hfs` made a seed image Linux could not read; Ubuntu 22.04's setuptools 59 breaks `pip install -e .` for a normal user; Go2Py's checkpoint holds CUDA tensors (`q3_go2py/go2py_compat.py` maps them to the CPU).
 
-## Still to do with the real robot
+## Real robot (lab, September 29-30)
 
-See [`lab/LAB_CHECKLIST.md`](lab/LAB_CHECKLIST.md): bridge the VM to the robot, run the read-only camera and state collector (`lab/collect_real.py`), then the sport-mode example with the instructor.
+In the lab the control panel connected to the Go2 EDU both by Ethernet cable (official SDK, DDS) and by Wi-Fi
+(WebRTC, the way the phone app connects), and the dog responded to the motion buttons: stand up, balance stand,
+walk, turn, lie down and STOP. Walking and turning moved the dog much less than expected: right after Stand up the
+joints are locked, and 0.2 m/s for 2 s is short for a dog that speeds up gradually. Walk and turn now read the
+dog's sport mode first and send BalanceStand if needed, use 0.3 m/s and 0.5 rad/s for 3 s, and print how far the
+dog measured it moved. This change still has to be tried on the real dog.
+
+Steps: [`lab/LAB_CHECKLIST.md`](lab/LAB_CHECKLIST.md). The same panel, reduced to the robot part and documented
+for classmates (addresses, commands, Windows and Linux), is at
+[harry567566/go2-control-panel](https://github.com/harry567566/go2-control-panel).
 
 ## Credits
 
