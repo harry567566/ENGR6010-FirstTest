@@ -5,8 +5,8 @@
 #
 # It builds TWO apps from one icon:
 #
-#   机器狗控制面板.app        the web panel (React in the browser) - the main one
-#   机器狗控制面板-经典.app    the original tkinter window - the fallback
+#   机器狗控制面板.app        the tkinter window - the one to use
+#   机器狗控制面板-网页版.app   the browser panel - secondary
 #
 # Both run the same buttons: web/server.py imports control_panel and uses its
 # ACTIONS table, so neither app can have a feature the other lacks. The web
@@ -63,9 +63,9 @@ finish() {      # $1 = app path
 }
 
 # ------------------------------------------------------------- the web app
-APP="$DEST/机器狗控制面板.app"
+APP="$DEST/机器狗控制面板-网页版.app"
 rm -rf "$APP"; mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-make_icns "$APP"; plist "$APP" "机器狗控制面板" "edu.engr6010.go2panel.web"
+make_icns "$APP"; plist "$APP" "机器狗控制面板-网页版" "edu.engr6010.go2panel.web"
 cat > "$APP/Contents/MacOS/launcher" <<EOF
 #!/bin/bash
 # Opens the Go2 web panel. Made by tools/make_panel_app.sh.
@@ -130,9 +130,9 @@ EOF
 finish "$APP"
 
 # -------------------------------------------------------- the classic app
-APP2="$DEST/机器狗控制面板-经典.app"
+APP2="$DEST/机器狗控制面板.app"
 rm -rf "$APP2"; mkdir -p "$APP2/Contents/MacOS" "$APP2/Contents/Resources"
-make_icns "$APP2"; plist "$APP2" "机器狗控制面板-经典" "edu.engr6010.go2panel.tk"
+make_icns "$APP2"; plist "$APP2" "机器狗控制面板" "edu.engr6010.go2panel.tk"
 cat > "$APP2/Contents/MacOS/launcher" <<EOF
 #!/bin/bash
 # Opens the original tkinter panel - the fallback if the browser one fails.
@@ -145,5 +145,6 @@ EOF
 finish "$APP2"
 
 echo ""
-echo "Double-click 机器狗控制面板 for the browser panel."
-echo "机器狗控制面板-经典 is the old tkinter window, kept as the fallback."
+echo "Double-click 机器狗控制面板 - the tkinter window, which has every button"
+echo "and the Cable / Wi-Fi / VM route selector."
+echo "机器狗控制面板-网页版 is the browser one, if you want the 3D view."
