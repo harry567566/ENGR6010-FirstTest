@@ -152,6 +152,46 @@ ACTIONS = [
            "电池电压、身体倾斜、身体高度、腿的角度、脚底受力、每秒多少条消息。",
            "和仿真器里一样的 rt/lowstate 消息。每次发运动命令前,都先用这个确认连接正常。"),
           say="This only listens. It reads the same rt/lowstate messages I used in the simulator."),
+        R("r_probe", ("real_probe.py", "25"),
+          ("1-2b  What IS this dog? (safe)",
+           "Listens on nine topics for 25 s and reports what this particular Go2 "
+           "publishes: model, firmware, whether the LiDAR is spinning and sending "
+           "a point cloud, how many points per sweep, and whether the robot "
+           "publishes its own odometry. Sends nothing.",
+           "A table of every topic with its message rate, a verdict in plain "
+           "words, and lab/data/probe_<time>.json to bring home.",
+           "Run this FIRST, before anything else. Every script written after "
+           "today is written against that JSON file, so guessing topic names "
+           "is what wastes a lab session."),
+          ("1-2b  这只狗到底有什么?(安全)",
+           "监听九个话题 25 秒,报告这只 Go2 到底发什么:型号、固件、"
+           "激光雷达转不转、发不发点云、每帧多少点、狗自己发不发里程计。"
+           "什么都不发送,狗不会动。",
+           "一张所有话题和频率的表、一段大白话结论,以及 "
+           "lab/data/probe_<时间>.json 带回家。",
+           "第一个跑这个,先于一切。今天之后写的所有代码都照着那个 JSON 写。"
+           "靠猜话题名字是最浪费实验室时间的事。"),
+          say="This only listens. It tells me what this robot can give me "
+              "before I write anything that depends on it.",
+          limit=40),
+        R("r_topics", ("real_topics.py", "20"),
+          ("1-2c  List every topic the dog publishes (safe)",
+           "Asks DDS itself what this robot is broadcasting, instead of "
+           "checking names we guessed. 1-2b tests nine likely topics; if this "
+           "firmware calls the point cloud something else, only this finds it.",
+           "Every topic with its type and a note on the important ones, plus "
+           "lab/data/topics_<time>.json.",
+           "Run this right after 1-2b. Between them they settle what the "
+           "robot can give us, with no guessing left."),
+          ("1-2c  列出狗发的每一个话题(安全)",
+           "直接问 DDS 这只狗在广播什么,而不是去试我们猜的名字。"
+           "1-2b 只测九个可能的话题;如果这个固件给点云起了别的名字,"
+           "只有这个找得到。",
+           "所有话题及其类型,重要的会单独标出,存 lab/data/topics_<时间>.json。",
+           "紧跟在 1-2b 后面跑。两个加起来就把'这只狗能给什么'问清楚了,不剩猜测。"),
+          say="This asks DDS what the robot actually publishes, so I am not "
+              "guessing topic names.",
+          limit=35),
         R("r_photo", ("real_photo.py", "{photo}"),
           ("1-3  Take a photo (safe)", "Asks the robot's front camera for one image (VideoClient).",
            "The photo opens on the Mac and is saved in lab/data/photos/.", "Read-only; the robot does not move."),
@@ -163,6 +203,29 @@ ACTIONS = [
            "The recording is saved in lab/data/ on the Mac and the folder opens.", "Read-only."),
           ("1-4  录 20 秒数据(安全)", "录 20 秒摄像头画面和狗的状态,给 Q4 用。录的时候可以有人用遥控器遛狗。",
            "录好的数据存在 Mac 的 lab/data/,并打开文件夹。", "只读。"), limit=45),
+        R("r_survey", ("real_survey.py", "--secs", "180", "--fps", "4",
+                       "--name", "walk"),
+          ("1-4b  Survey the building, 3 min (safe)",
+           "Records everything at once for three minutes: state at 50 Hz, the "
+           "LiDAR point cloud if this robot has one, on-board odometry if it "
+           "publishes any, and camera frames at 4 fps - all on one clock. "
+           "Sends nothing; someone drives with the remote.",
+           "lab/data/survey_walk_<time>/ with meta.json, state.jsonl, "
+           "odom.jsonl, clouds/ and frames/.",
+           "Point clouds are saved as raw bytes plus their field layout, "
+           "not decoded here. The robot stays in the lab, so anything this "
+           "misses cannot be collected again later."),
+          ("1-4b  扫一遍楼,3 分钟(安全)",
+           "三分钟内把能录的全录下来:50 Hz 的状态、有雷达就录点云、"
+           "狗发里程计就录里程计、4 fps 的相机画面 —— 全部挂在同一个时钟上。"
+           "什么都不发送;让人用遥控器遛狗。",
+           "存到 lab/data/survey_walk_<时间>/,含 meta.json、state.jsonl、"
+           "odom.jsonl、clouds/、frames/。",
+           "点云按原始字节保存,外加字段布局,不在现场解码 —— "
+           "狗留在实验室,今天漏掉的东西没法回头再采。"),
+          say="This only listens. It records the point cloud, the state and "
+              "the camera on one clock so they can be lined up afterwards.",
+          limit=240),
         R("m_standup", ("real_sport.py", "standup", "--yes"),
           ("1-5  Stand up", "Sends StandUp to the robot's own controller (SportClient).",
            "The dog stands up and holds still.",

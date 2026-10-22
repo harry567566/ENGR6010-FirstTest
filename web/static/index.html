@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Go2</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+  <!-- Anything that stops the panel from drawing gets written here. A dark
+       page with nothing on it used to be the only symptom, and it looks the
+       same whether the server died, the script is stale or React threw. -->
+  <div id="fatal"></div>
+  <div id="root"></div>
+  <!-- vendored, so the lab needs no internet and no npm -->
+  <script src="vendor/react.js"></script>
+  <script src="vendor/react-dom.js"></script>
+  <script src="vendor/htm.js"></script>
+  <script src="vendor/three.js"></script>
+  <script src="i18n.js"></script>
+  <script src="scene.js"></script>
+  <script src="maps.js"></script>
+  <script src="app.js"></script>
+  <script>
+  /* The last line of defence: if a script above failed to load at all, no
+     handler inside app.js ever runs, so check the result by hand. This one
+     cannot use i18n.js either - that file may be exactly what is missing -
+     so it carries its own two sentences. */
+  (function () {
+    var zh = true;
+    try {
+      var saved = localStorage.getItem("go2lang");
+      zh = saved ? saved === "zh" : true;     // same default as i18n.js
+    } catch (e) {}
+    document.documentElement.lang = zh ? "zh" : "en";
+    document.title = zh ? "Go2 控制面板" : "Go2 control panel";
+
+    setTimeout(function () {
+      var r = document.getElementById("root");
+      if (r && r.children.length) return;                  // drew fine
+      var f0 = document.getElementById("fatal");
+      // showFatal already said something specific - a stack trace beats
+      // this generic sentence, so leave it alone
+      if (f0 && f0.innerHTML) return;
+      var missing = [];
+      if (typeof React === "undefined") missing.push("react.js");
+      if (typeof ReactDOM === "undefined") missing.push("react-dom.js");
+      if (typeof htm === "undefined") missing.push("htm.js");
+      if (typeof THREE === "undefined") missing.push("three.js");
+      if (typeof L === "undefined") missing.push("i18n.js");
+      if (typeof Scene3D === "undefined") missing.push("scene.js");
+      var f = document.getElementById("fatal");
+      f.style.display = "block";
+      f.innerHTML = "<b></b><div class='d'></div><button " +
+                    "onclick='location.reload()'></button>";
+      f.querySelector("b").textContent =
+        zh ? "面板没画出来" : "The panel did not draw";
+      f.querySelector("button").textContent = zh ? "重新加载" : "Reload";
+      f.querySelector(".d").textContent = missing.length
+        ? (zh ? "这些文件没加载成功:" + missing.join("、") +
+                "\n\n大概是 web/static/ 里的文件不见了,或者服务器没在跑。"
+              : "These files did not load: " + missing.join(", ") +
+                "\n\nSomething is missing from web/static/, or the server " +
+                "is not running.")
+        : (zh ? "脚本都加载了,但界面没画出来。按一下重新加载;" +
+                "还是这样的话,终端里应该有报错。"
+              : "Every script loaded but nothing was drawn. Press Reload; " +
+                "if it stays this way, the terminal should show an error.");
+    }, 3000);
+  })();
+  </script>
+</body>
+</html>

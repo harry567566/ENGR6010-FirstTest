@@ -20,4 +20,15 @@ MUJOCO_LOG.TXT
 lab/.go2_aes_key
 lab/.go2_wifi_ip
 # photos, recordings and panel logs from the lab
-lab/data/
+# recorded robot data: point clouds and camera frames are large and get
+# re-collected rather than read in a diff. The session reports are the
+# exception - a lab run with no internet is only worth recording if the
+# record can be brought back, so those go in.
+lab/data/*
+!lab/data/sessions/
+lab/data/sessions/*
+!lab/data/sessions/report_*.md
+!lab/data/sessions/session_*.jsonl
+
+# the browser's own self-report: regenerated every time a page loads
+web/clientlog.json
