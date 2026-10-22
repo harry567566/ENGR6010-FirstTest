@@ -144,6 +144,24 @@ ACTIONS = [
            "(Wi-Fi:检查 Mac 是否连着狗的 Wi-Fi、狗有没有回应。虚拟机备用路线:重启一次虚拟机,给它加一张"
            "接网线的网卡,再在 Ubuntu 里做同样的事,地址用 192.168.123.223。)"),
           say="The Go2 is at 192.168.123.161 on its own wired network, so my computer joins that network first."),
+        A("w_live", "mac_window", [WIFI_PY, os.path.join(LAB, "wifi_live.py")],
+          ("1-1b  Live view over Wi-Fi: camera, LiDAR, WASD",
+           "Opens one window that holds a SINGLE Wi-Fi connection and shows the front camera, the LiDAR "
+           "point cloud from above, and the dog's state - all at once. Every other Wi-Fi button opens its own "
+           "connection and hangs up, which costs seconds and makes the dog answer '429 Too Many Requests' when "
+           "two land together. Opening the window commands nothing; driving is behind a tick box inside it.",
+           "A window with the camera on the left and the LiDAR on the right. Tick 'allow motion' and W A S D "
+           "drive, Q E turn, space stops.",
+           "The point cloud does come over Wi-Fi - not as DDS, which really is cable-only, but on the robot's "
+           "own WebRTC channel, the one the phone app draws its map from."),
+          ("1-1b  Wi-Fi 实时画面:摄像头 + 雷达 + WASD",
+           "打开一个窗口,用【一条】常驻 Wi-Fi 连接同时显示前置摄像头、俯视的激光雷达点云和狗的状态。"
+           "其他每个 Wi-Fi 按钮都是自己连一次再断开,既慢,两个挨着按还会让狗回 '429 Too Many Requests'。"
+           "打开窗口本身不给狗发任何命令;开狗要在窗口里单独勾选。",
+           "一个窗口:左边摄像头,右边雷达俯视图。勾上'允许运动'后 W A S D 走、Q E 转、空格停。",
+           "点云确实能走 Wi-Fi 拿到 —— 不是 DDS(DDS 确实只能走网线),而是狗自己的 WebRTC 通道,"
+           "手机 App 画地图用的就是它。"),
+          say="One Wi-Fi connection, held open, carrying the camera, the LiDAR and the keyboard at the same time."),
         R("r_state", ("real_state.py", "10"),
           ("1-2  Read robot state (safe)", "Listens to the robot's messages for 10 s. Sends nothing, so the robot "
            "does not move.", "Battery voltage, body tilt, body height, leg angles, foot forces, message rate.",
@@ -1086,12 +1104,22 @@ class Panel:
             bad(f"The dog does not answer over Wi-Fi at {wifi_dog_ip(target)}: is it on? Click 1-1 to check. "
                 "/ 狗没有回应:开机了吗?点 1-1 检查。")
             return
+        script = a["run"][0]
+        if script not in WIFI_SCRIPT:
+            # These read DDS topics straight off the wired bus, and the dog's
+            # hotspot does not carry DDS - it carries WebRTC. Without this the
+            # KeyError below killed the worker thread and the button printed
+            # nothing at all, which is the worst way to say "not supported".
+            bad(f"{label}: this one needs the Ethernet cable. It reads DDS topics directly, and the dog's "
+                f"Wi-Fi carries WebRTC instead. For the camera and the point cloud over Wi-Fi, use 1-1b. "
+                f"/ 这个按钮要插网线:它直接读 DDS 话题,而狗的 Wi-Fi 走的是 WebRTC。"
+                f"想在 Wi-Fi 上看摄像头和点云,用 1-1b。")
+            return
         stamp = time.strftime("%Y%m%d_%H%M%S")
         photo = os.path.join(LOCAL_DATA, "photos", f"photo_{stamp}.jpg")
         run_dir = os.path.join(LOCAL_DATA, f"wifi_run_{stamp}")
         os.makedirs(os.path.dirname(photo), exist_ok=True)
-        script, *args = a["run"]
-        args = [x.replace("{photo}", photo).replace("{run}", run_dir) for x in args]
+        args = [x.replace("{photo}", photo).replace("{run}", run_dir) for x in a["run"][1:]]
         after = ["open", photo] if "{photo}" in a["run"] else ["open", run_dir] if "{run}" in a["run"] else None
         # a Wi-Fi command first spends a few seconds connecting, so it gets more time than over the cable
         self.start([WIFI_PY, "-u", os.path.join(LAB, WIFI_SCRIPT[script]), target, *args], HERE, a, label,
