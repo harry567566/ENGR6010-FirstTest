@@ -26,6 +26,7 @@ internet or npm.
 import json
 import os
 import queue
+import socket
 import subprocess
 import sys
 import threading
@@ -63,6 +64,63 @@ def record(kind, **fields):
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
     except Exception:
         pass                      # a lab session must not die over a log
+
+
+# ------------------------------------------------------------- lifetime
+# Close the last window and the program stops, like any other app. The
+# count of open SSE streams is the only honest measure of "is anyone
+# looking at this": a reload drops it to zero for a moment, which is what
+# the grace period is for. GO2_PANEL_STAY=1 keeps it running regardless,
+# for a lab session driven from more than one window.
+IDLE_QUIT = 0 if os.environ.get("GO2_PANEL_STAY") else 12.0
+
+# Open pages, by the id each one sends with its status poll. Counting SSE
+# sockets instead looked obvious and was wrong: Chrome keeps closed pages'
+# sockets in a pool, so a shut window still looked like a viewer. A page
+# that is really gone simply stops checking in.
+viewers = {}                       # client id -> last seen
+viewers_lock = threading.Lock()
+_empty_since = {"t": time.time()}
+
+
+def seen(cid):
+    if not cid:
+        return
+    with viewers_lock:
+        viewers[cid] = time.time()
+
+
+def gone(cid):
+    with viewers_lock:
+        viewers.pop(cid, None)
+
+
+def viewer_count(max_age=8.0):
+    now = time.time()
+    with viewers_lock:
+        for k in [k for k, t in viewers.items() if now - t > max_age]:
+            del viewers[k]
+        return len(viewers)
+
+
+def watch_for_empty(srv):
+    """Stop the program once the last window is gone, like any other app."""
+    def loop():
+        while True:
+            time.sleep(2.0)
+            with procs_lock:
+                busy_now = any(p.poll() is None for p in procs.values())
+            # never pull the floor out from under a command the robot is
+            # still carrying out, even if every window was closed
+            if viewer_count() or busy_now:
+                _empty_since["t"] = time.time()
+                continue
+            if time.time() - _empty_since["t"] > IDLE_QUIT:
+                print("no window left - stopping", flush=True)
+                record("quit", why="no window open")
+                srv.shutdown()
+                return
+    threading.Thread(target=loop, daemon=True).start()
 
 
 # ----------------------------------------------------------------- state
@@ -205,11 +263,26 @@ def run_wifi(key, a, label):
 
     script = a["run"][0]
     if script not in CP.WIFI_SCRIPT:
-        line(f"{label}: this one only works over the cable. It reads DDS "
-             f"topics straight from the dog, and Wi-Fi (WebRTC) does not "
-             f"carry them.  /  这个按钮只能走网线:它直接读 DDS 话题,"
-             f"Wi-Fi 那条路(WebRTC)传不了。", "bad")
-        emit("done", key=key, ok=False)
+        # No WebRTC twin, so try DDS over the Wi-Fi card instead of
+        # refusing. If the dog publishes its topics there, this works and
+        # the assumption that it is cable-only was wrong; if it does not,
+        # the script says "0 messages" and we know, from the robot rather
+        # than from a guess.
+        wif = wifi_iface()
+        if not wif:
+            line(f"{label}: no Wi-Fi interface found on this Mac.", "bad")
+            emit("done", key=key, ok=False)
+            return
+        line(f"  no WebRTC version of this one, so trying DDS over the "
+             f"Wi-Fi card ({wif}). If the dog does not publish its topics "
+             f"there, it will report nothing - that is the answer, not a "
+             f"crash.  /  这个没有 WebRTC 版本,改成用 Wi-Fi 网卡({wif})"
+             f"直接试 DDS。狗要是不在 Wi-Fi 上发话题,它会报 0 条消息 —— "
+             f"那就是答案,不是崩溃。", "info")
+        _, args = a["run"][0], [x for x in a["run"][1:]]
+        _spawn(key, label,
+               [CP.ROBOT_PY, "-u", os.path.join(CP.LAB, script), wif, *args],
+               a.get("limit", 20), tag="wifi-dds")
         return
 
     with procs_lock:
@@ -280,12 +353,20 @@ def run_action(key, route):
     a = find(key)
     if a is None:
         line(f"unknown action {key}", "bad")
+        emit("done", key=key, ok=False)
         return
     label = a["zh"]["label"]
 
-    if a.get("where") != "robot" or not a.get("run"):
+    # r_net and m_stop carry no run script of their own - the panel runs
+    # mac_net_up.sh / wifi_check.sh / a stop command for them - so they are
+    # routed before the "is this a robot script" guard, which used to
+    # reject 1-1 outright and, worse, return without a done event, leaving
+    # the button stuck on "running" and every other button disabled.
+    if a.get("where") != "robot" or not (a.get("run") or key in ("r_net",
+                                                                 "m_stop")):
         line(f"{label}: this button is not a robot script; "
              f"use the tkinter panel for it", "bad")
+        emit("done", key=key, ok=False)
         return
 
     if route == "wifi":
@@ -304,10 +385,14 @@ def run_action(key, route):
                         "[r]eal_sport.py .* (standup|balance|move)"])
         line(f"  ended {n} running motion command(s)" if n
              else "  nothing was running", "info")
+        if not a.get("run"):            # nothing further to spawn
+            emit("done", key=key, ok=True)
+            return
 
     if not os.path.exists(CP.ROBOT_PY):
         line("The Mac robot environment is missing: run  "
              "bash lab/setup_mac_sdk.sh", "bad")
+        emit("done", key=key, ok=False)
         return
     iface = CP.mac_robot_iface()
     if not iface and key != "r_net":
@@ -419,15 +504,13 @@ def map_path(name):
 
 
 def cable_only_keys():
-    """Buttons with no Wi-Fi twin, worked out rather than listed.
+    """Buttons with no WebRTC twin: they speak DDS directly.
 
-    control_panel.WIFI_SCRIPT maps each cable script to its Wi-Fi version;
-    a script missing from it has none. Those all speak DDS straight to the
-    dog, which only reaches it over the wired network (and only on an EDU).
-    Wi-Fi goes through WebRTC, like the phone app: it carries commands and
-    the camera, but no DDS topics - so no point cloud, no topic list and no
-    survey. Deriving the set means it cannot drift out of date the way a
-    hand-written list does."""
+    That does NOT mean they cannot work over Wi-Fi. Whether the dog
+    publishes its DDS topics on the Wi-Fi interface as well as the wired
+    one is a property of the robot nobody here has measured, so these are
+    run over the Wi-Fi card and allowed to report what they find. Blocking
+    them on a guess is how a lab session gets wasted."""
     out = []
     for a in all_actions():
         run = a.get("run")
@@ -438,7 +521,55 @@ def cable_only_keys():
     return sorted(out)
 
 
-def status():
+_status_cache = {"t": 0.0, "v": None}
+
+
+def wifi_iface():
+    """The Mac's Wi-Fi interface name (en0), not its address.
+
+    DDS needs the interface, not the IP, and on the dog's own hotspot the
+    Wi-Fi card is the only card facing the robot."""
+    try:
+        import re
+        out = subprocess.run(["networksetup", "-listallhardwareports"],
+                             capture_output=True, text=True).stdout
+        m = re.search(r"Hardware Port: Wi-Fi\nDevice: (\S+)", out)
+        return m.group(1) if m else None
+    except OSError:
+        return None
+
+
+def _dog_wifi_up(ip):
+    """Is the dog's Wi-Fi control port answering? Fast, or not at all.
+
+    control_panel's version waits 1.5 s on each of two ports, so it costs
+    3 s when nothing answers - and the panel polls status every 2.5 s, so
+    that probe was never not running. On a LAN a port either answers in a
+    few milliseconds or is not there."""
+    for port in (9991, 8081):
+        try:
+            with socket.create_connection((ip, port), timeout=0.4):
+                return True
+        except OSError:
+            pass
+    return False
+
+
+def status(max_age=2.0):
+    """The panel's view of what is connected.
+
+    Cached: it shells out to ifconfig, networksetup and ipconfig and opens
+    sockets, which is far too much to redo for every poll of every open
+    tab."""
+    now = time.time()
+    if _status_cache["v"] is not None and now - _status_cache["t"] < max_age:
+        return _status_cache["v"]
+    v = _status_uncached()
+    _status_cache.update(t=now, v=v)
+    return v
+
+
+def _status_uncached():
     iface = CP.mac_robot_iface()
     reachable = False
     if iface:
@@ -452,7 +583,7 @@ def status():
     mac_wifi = CP.mac_wifi_ip()
     on_dog_wifi = (mac_wifi.startswith("192.168.12.") if target == "ap"
                    else bool(mac_wifi))
-    wifi_ok = on_dog_wifi and CP.dog_wifi_port_open(CP.wifi_dog_ip(target))
+    wifi_ok = on_dog_wifi and _dog_wifi_up(CP.wifi_dog_ip(target))
     return {"iface": iface or "", "robot_ip": CP.ROBOT_IP,
             "reachable": reachable, "busy": busy,
             "robot_py": os.path.exists(CP.ROBOT_PY),
@@ -461,7 +592,9 @@ def status():
             "mac_wifi_ip": mac_wifi,
             "dog_wifi_ip": CP.wifi_dog_ip(target),
             "wifi_reachable": wifi_ok,
-            "cable_only": cable_only_keys()}
+            "viewers": viewer_count(),
+            "wifi_iface": wifi_iface() or "",
+            "dds_over_wifi": cable_only_keys()}
 
 
 # ----------------------------------------------------------- the handover
@@ -631,9 +764,14 @@ class Handler(SimpleHTTPRequestHandler):
         for h in ("If-Modified-Since", "If-None-Match"):
             if h in self.headers:
                 del self.headers[h]
-        if self.path == "/api/actions":
+        path, _, query = self.path.partition("?")
+        if path == "/api/actions":
             return self._json(action_list())
-        if self.path == "/api/status":
+        if path == "/api/status":
+            # the page's id rides along on a poll it already makes, so
+            # knowing whether a window is still open costs no extra request
+            from urllib.parse import parse_qs
+            seen(parse_qs(query).get("c", [""])[0])
             return self._json(status())
         if self.path == "/api/events":
             return self.sse()
@@ -735,10 +873,11 @@ class Handler(SimpleHTTPRequestHandler):
             self.wfile.flush()
             while True:
                 try:
-                    msg = q.get(timeout=15)
+                    msg = q.get(timeout=5)
                     self.wfile.write(f"data: {msg}\n\n".encode())
                 except queue.Empty:
-                    self.wfile.write(b": keepalive\n\n")   # keep proxies open
+                    # also how a closed tab is noticed: this write fails
+                    self.wfile.write(b": keepalive\n\n")
                 self.wfile.flush()
         except Exception:
             pass
@@ -779,6 +918,10 @@ class Handler(SimpleHTTPRequestHandler):
             # body is already decoded above; this is a dict, not a string
             self.client_log(dict(body) if isinstance(body, dict) else {})
             return self._json({"ok": True})
+        if self.path == "/api/bye":
+            # the window is closing; drop it now instead of waiting it out
+            gone((body or {}).get("c"))
+            return self._json({"ok": True})
         if self.path == "/api/live/start":
             ok, msg = LIVE.start(CP.mac_robot_iface())
             line(("  " if ok else "✗ ") + msg, "info" if ok else "bad")
@@ -786,21 +929,67 @@ class Handler(SimpleHTTPRequestHandler):
         return self._json({"error": "unknown"}, 404)
 
 
+SHOW_TAB = """
+on run argv
+  set target to item 1 of argv
+  try
+    tell application "Google Chrome"
+      repeat with w in windows
+        repeat with i from 1 to (count of tabs of w)
+          if (URL of tab i of w) contains target then
+            set active tab index of w to i
+            set index of w to 1
+            activate
+            return "focused"
+          end if
+        end repeat
+      end repeat
+      open location ("http://" & target)
+      activate
+      return "opened"
+    end tell
+  on error
+    return "no-chrome"
+  end try
+end run
+"""
+
+
+def show(url):
+    """Bring the panel up, in the tab it is already in if there is one.
+
+    Plain `open <url>` adds another tab every time the icon is clicked,
+    which leaves a row of identical panels all polling the same server."""
+    target = url.replace("http://", "")
+    try:
+        r = subprocess.run(["osascript", "-", target], input=SHOW_TAB,
+                           capture_output=True, text=True, timeout=10)
+        if "no-chrome" not in r.stdout:
+            return
+    except Exception:
+        pass
+    try:                                      # not Chrome, or AppleScript off
+        subprocess.Popen(["open", url], stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+
+
 def main():
     if not os.path.isdir(STATIC):
         sys.exit(f"missing {STATIC}")
     srv = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
+    if IDLE_QUIT:
+        watch_for_empty(srv)
     url = f"http://127.0.0.1:{PORT}"
     print(f"Go2 panel (web)  ->  {url}")
     n = sum(len(c["actions"]) for c in action_list())
     print(f"  {n} buttons in {len(action_list())} cards, taken from control_panel.ACTIONS")
     print(f"  the tkinter panel still works and is the fallback")
+    print(f"  closing the last window stops this; GO2_PANEL_STAY=1 to keep it")
     print(f"  Ctrl+C to stop\n")
-    try:
-        subprocess.Popen(["open", url], stdout=subprocess.DEVNULL,
-                         stderr=subprocess.DEVNULL)
-    except Exception:
-        pass
+    if not os.environ.get("GO2_PANEL_NO_OPEN"):
+        show(url)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

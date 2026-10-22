@@ -37,7 +37,9 @@ echo "Close the Unitree phone app: the dog accepts only one Wi-Fi client at a ti
 if [ -s lab/.go2_aes_key ] || [ -n "${GO2_AES_KEY:-}" ]; then
   echo "AES key: found (needed only on firmware 1.1.15 or newer)"
 else
-  echo "AES key: none (fine on firmware 1.1.14 or older; newer firmware needs it, see LAB_CHECKLIST.md)"
+  echo "AES key: none. Fine on Go2 firmware 1.1.14 or older. If this dog is 1.1.15+, Wi-Fi will say so"
+  echo "  when you press 1-2, and the key must come from the account the dog is registered to (the instructor)."
+  echo "  / 没有密钥。老固件不需要。如果这只狗是新固件,按 1-2 时会直接告诉你,密钥要找老师的账号取。"
 fi
 
 if curl -s -m 3 -o /dev/null https://www.apple.com; then

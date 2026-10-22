@@ -64,8 +64,23 @@ async def connect(target, timeout=25.0):
         fail(4, "The dog already has a Wi-Fi client: close the Unitree phone app (or any other program) and try again.",
              "狗已经被别的程序连着:先关掉手机上的 Unitree App,再试。")
     except auth.AesKeyRequiredError:
-        fail(5, "This firmware (1.1.15 or newer) needs the dog's AES key in lab/.go2_aes_key. See LAB_CHECKLIST.md.",
-             "这个固件需要狗的 AES 密钥(放在 lab/.go2_aes_key),见 LAB_CHECKLIST.md。")
+        # Nothing here can be fixed without internet and the Unitree account
+        # the robot is bound to, which for a lab robot is the instructor's.
+        # So say that, rather than pointing at a document.
+        fail(5, "This dog's firmware (Go2 1.1.15 or newer) needs its own "
+                "AES key, and there is no way around it over Wi-Fi. The key "
+                "comes from the Unitree account the DOG is registered to - "
+                "the instructor's, not yours - and fetching it needs "
+                "internet:  .venv_wifi/bin/unitree-fetch-aes-key --email "
+                "<that account> --device-type Go2 --sn <the dog's serial>. "
+                "Save it in lab/.go2_aes_key. Until then use the Ethernet "
+                "cable, which needs no key.",
+             "这只狗的固件(Go2 1.1.15 以上)必须有它自己的 AES 密钥,走 Wi-Fi "
+             "绕不过去。密钥要用【这只狗绑定的那个 Unitree 账号】去云端取 —— "
+             "那是老师的账号,不是你的 —— 而且取密钥需要联网:\n"
+             "  .venv_wifi/bin/unitree-fetch-aes-key --email <老师的账号> "
+             "--device-type Go2 --sn <狗的序列号>\n"
+             "取到后存进 lab/.go2_aes_key。在那之前,用网线 —— 网线不需要密钥。")
     except auth.AesKeyRejectedError:
         fail(5, "The dog rejected the AES key in lab/.go2_aes_key: it belongs to another dog, or it is mistyped.",
              "狗不认这个 AES 密钥:可能是别的狗的,或者抄错了。")

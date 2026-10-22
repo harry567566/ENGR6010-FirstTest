@@ -100,14 +100,17 @@ const L = (() => {
     cableHint:    ["网线:全部功能,包括点云、建图、实时 3D。需要 EDU 版。",
                    "Cable: everything, including the point cloud, mapping "
                    + "and the live 3D view. Needs a Go2 EDU."],
-    wifiHint:     ["Wi-Fi:走 WebRTC,和手机 App 一样。能动、能拍照、能录,"
-                   + "但没有点云/建图/实时画面。狗一次只接一个 Wi-Fi 连接,"
+    wifiHint:     ["Wi-Fi:走 WebRTC,和手机 App 一样。能动、能拍照、能录。"
+                   + "标着「试 DDS」的按钮会改用 Wi-Fi 网卡直接试点云 —— "
+                   + "成不成要狗说了算。狗一次只接一个 Wi-Fi 连接,"
                    + "先关掉手机 App。",
                    "Wi-Fi: WebRTC, the same path the phone app uses. It can "
-                   + "move, photograph and record, but carries no point "
-                   + "cloud, no mapping and no live view. The dog accepts "
-                   + "one Wi-Fi client at a time, so close the phone app."],
-    cableOnly:    ["只能走网线",              "cable only"],
+                   + "move, photograph and record. The buttons marked \"try "
+                   + "DDS\" go after the point cloud over the Wi-Fi card "
+                   + "instead - whether that works is the dog's answer to "
+                   + "give. The dog accepts one Wi-Fi client at a time, so "
+                   + "close the phone app."],
+    tryDds:       ["试 DDS",                  "try DDS"],
     dogWifi:      ["狗的 Wi-Fi",              "dog Wi-Fi"],
     session:      ["这次测试的记录",          "This session"],
     sessionHint:  ["断网也在记。回来点「导出」,把那个文件给我,我就能看到发生了什么。",

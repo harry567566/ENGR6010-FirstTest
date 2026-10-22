@@ -17,6 +17,11 @@ const html = htm.bind(React.createElement);
 // failed to load, fall back to the key so the error box still has words
 const t = (...a) => (typeof L !== "undefined" ? L.t(...a) : String(a[0]));
 
+// This window's id. It rides along on the status poll, so the server knows
+// a window is still open without any extra traffic, and stops itself once
+// the last one is gone.
+const CID = Math.random().toString(36).slice(2) + Date.now().toString(36);
+
 const F = (v, d = 2) => (v === undefined || v === null || Number.isNaN(v)
   ? "–" : (+v).toFixed(d));
 const DEG = 57.2958;
@@ -121,7 +126,7 @@ function useStatus() {
   const [s, setS] = useState({ iface: "", reachable: false, busy: [] });
   useEffect(() => {
     let alive = true;
-    const tick = () => fetch("/api/status").then(r => r.json())
+    const tick = () => fetch("/api/status?c=" + CID).then(r => r.json())
       .then(j => alive && setS(j)).catch(() => {});
     tick(); const h = setInterval(tick, 2500);
     return () => { alive = false; clearInterval(h); };
@@ -157,14 +162,48 @@ function useLive(reachable) {
 
 function useEvents(onLine, onDone) {
   useEffect(() => {
-    const es = new EventSource("/api/events");
-    es.onmessage = e => {
-      let m; try { m = JSON.parse(e.data); } catch { return; }
-      if (m.kind === "line") onLine(m);
-      else if (m.kind === "done") onDone(m);
+    let es = null, dead = false;
+
+    // Opened only once the page has finished loading. /api/events is a
+    // response that never ends, and a request still in flight when the
+    // document would otherwise be done keeps the load event from firing -
+    // so the tab spins for ever, which looks exactly like a page that
+    // cannot load.
+    const open = () => {
+      if (dead) return;
+      es = new EventSource("/api/events");
+      es.onmessage = e => {
+        let m; try { m = JSON.parse(e.data); } catch { return; }
+        if (m.kind === "line") onLine(m);
+        else if (m.kind === "done") onDone(m);
+      };
     };
-    return () => es.close();
+    if (document.readyState === "complete") open();
+    else window.addEventListener("load", open, { once: true });
+
+    return () => {
+      dead = true;
+      window.removeEventListener("load", open);
+      if (es) es.close();
+    };
   }, [onLine, onDone]);
+}
+
+/* Tell the server when this page goes away, so closing the tab closes the
+ * program. Without it the panel keeps running in the background long after
+ * the last window is shut, which is not how an app behaves. */
+function useGoodbye() {
+  useEffect(() => {
+    const bye = () => {
+      try {
+        navigator.sendBeacon("/api/bye",
+          new Blob([JSON.stringify({ c: CID })],
+                   { type: "application/json" }));
+      } catch {}
+    };
+    window.addEventListener("pagehide", bye);
+    return () => window.removeEventListener("pagehide", bye);
+  }, []);
 }
 
 /* ------------------------------------------------------------------ views */
@@ -304,16 +343,18 @@ function Telemetry({ live }) {
 }
 
 /* ----------------------------------------------------------------- pieces */
-function Button({ a, lang, busy, anyBusy, onRun, blocked }) {
+function Button({ a, lang, busy, anyBusy, onRun, note }) {
   const w = a[lang] || a.en || {};     // this action's own wording, from ACTIONS
+  // Nothing here is ever disabled for being "unsupported": whether the dog
+  // answers over this route is the robot's answer to give, not ours.
   return html`
     <button class=${"btn" + (a.motion ? " motion" : "") + (busy ? " busy" : "")}
-            disabled=${busy || blocked || (anyBusy && !a.motion)}
+            disabled=${busy || (anyBusy && !a.motion)}
             onClick=${() => onRun(a.key)}
             title=${(w.what || "") + "\n\n" + (w.why || "")}>
       <span class="lab">${w.label || a.key}</span>
-      ${blocked ? html`<span class="tag">${t("cableOnly")}</span>`
-        : busy ? html`<span class="tag">${t("running")}</span>`
+      ${busy ? html`<span class="tag">${t("running")}</span>`
+        : note ? html`<span class="tag">${note}</span>`
         : a.motion ? html`<span class="tag motion">${t("moves")}</span>` : null}
     </button>`;
 }
@@ -408,6 +449,7 @@ function App() {
   const st = useStatus();
   const live = useLive(st.reachable);
   useAutoUpdate();
+  useGoodbye();
 
   useEffect(() => {
     fetch("/api/actions").then(r => r.json()).then(setCards).catch(() => {});
@@ -418,21 +460,50 @@ function App() {
     return n.length > 3000 ? n.slice(-2000) : n;
   }), []);
   const onDone = useCallback(m => setRunning(r => {
+    if (!(m.key in r)) return r;
     const n = { ...r }; delete n[m.key]; return n; }), []);
   useEvents(onLine, onDone);
 
   const run = key => {
-    setRunning(r => ({ ...r, [key]: true }));
+    setRunning(r => ({ ...r, [key]: Date.now() }));
     fetch("/api/run", { method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ key, route }) })
       .catch(() => setRunning(r => { const n = { ...r }; delete n[key]; return n; }));
   };
 
+  // The server knows what is actually running; the SSE "done" event is
+  // only a hint. Joining the dog's Wi-Fi drops the SSE stream, and any
+  // "done" sent while it was down is gone - which used to leave a button
+  // reading "running" for ever and, through anyBusy, disable every other
+  // button on the panel.
+  //
+  // The grace period matters: a button is marked running the instant it is
+  // pressed, and the server needs a moment before it appears in busy, so a
+  // key is only dropped once it has been unaccounted for a few seconds.
+  useEffect(() => {
+    const live = st.busy || [];
+    const now = Date.now();
+    setRunning(r => {
+      let changed = false;
+      const n = {};
+      for (const [k, since] of Object.entries(r)) {
+        if (live.includes(k) || now - since < 4000) n[k] = since;
+        else changed = true;
+      }
+      return changed ? n : r;
+    });
+  }, [st]);
+
   const anyBusy = Object.keys(running).length > 0;
-  const cableOnly = st.cable_only || [];
+  const ddsOverWifi = st.dds_over_wifi || [];
+  // r_net (1-1) has no run script of its own - the server runs
+  // mac_net_up.sh or wifi_check.sh for it - so it fails a has_run test and
+  // used to be filtered out of the panel entirely. It is the first button
+  // anyone needs.
   const acts = cards.flatMap(c => (c.actions || []).filter(
-    a => a.where === "robot" && a.has_run && a.key !== "m_stop"));
+    a => a.where === "robot" && a.key !== "m_stop"
+         && (a.has_run || a.key === "r_net")));
   const safe = acts.filter(a => !a.motion);
   const moves = acts.filter(a => a.motion);
 
@@ -480,13 +551,13 @@ function App() {
           <h2>${t("safeHead")}</h2>
           ${safe.map(a => html`<${Button} key=${a.key} a=${a} lang=${lang}
             busy=${!!running[a.key]} anyBusy=${anyBusy} onRun=${run}
-            blocked=${route === "wifi" && cableOnly.includes(a.key)} />`)}
+            note=${route === "wifi" && ddsOverWifi.includes(a.key)
+                   ? t("tryDds") : ""} />`)}
 
           <h2>${t("moveHead")}</h2>
           <div class="hint">${t("moveHint")}</div>
           ${moves.map(a => html`<${Button} key=${a.key} a=${a} lang=${lang}
-            busy=${!!running[a.key]} anyBusy=${anyBusy} onRun=${run}
-            blocked=${route === "wifi" && cableOnly.includes(a.key)} />`)}
+            busy=${!!running[a.key]} anyBusy=${anyBusy} onRun=${run} />`)}
 
           <${Session} />
 

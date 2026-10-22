@@ -68,29 +68,64 @@ rm -rf "$APP"; mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 make_icns "$APP"; plist "$APP" "机器狗控制面板" "edu.engr6010.go2panel.web"
 cat > "$APP/Contents/MacOS/launcher" <<EOF
 #!/bin/bash
-# Opens the Go2 web panel and the browser. Made by tools/make_panel_app.sh.
+# Opens the Go2 web panel. Made by tools/make_panel_app.sh.
+#
+# Three things this has to get right, because they are what makes it feel
+# like an app rather than a script:
+#   - double-click starts it
+#   - closing the window stops it (the server quits when no page checks in)
+#   - clicking the icon again focuses the page that is already open,
+#     instead of leaving a row of identical tabs behind
 export PATH="\$HOME/miniconda3/envs/go2/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 export LANG=en_US.UTF-8 PYTHONIOENCODING=utf-8
 LOG="\$HOME/Library/Logs/Go2Panel.log"
-cd "$FT" || exit 1
-{
-  echo ""
-  echo "===== \$(date '+%F %T')  web panel starting ====="
-} >> "\$LOG"
+DIR="$FT"
+URL="http://127.0.0.1:8742"
+cd "\$DIR" || exit 1
+{ echo ""; echo "===== $(date '+%F %T')  web panel starting ====="; } >> "\$LOG"
 
-# The robot venv has the Unitree SDK, so live telemetry works. Without it the
-# panel still serves the buttons, it just cannot subscribe to the robot.
-PYBIN="$RPY"
-[ -x "\$PYBIN" ] || PYBIN="$PY"
+show() {
+  /usr/bin/osascript - "127.0.0.1:8742" <<'AS' >/dev/null 2>&1 && return 0
+on run argv
+  set target to item 1 of argv
+  tell application "Google Chrome"
+    repeat with w in windows
+      repeat with i from 1 to (count of tabs of w)
+        if (URL of tab i of w) contains target then
+          set active tab index of w to i
+          set index of w to 1
+          activate
+          return
+        end if
+      end repeat
+    end repeat
+    open location ("http://" & target)
+    activate
+  end tell
+end run
+AS
+  open "\$URL"
+}
 
-# If a panel is already serving, just open the page again instead of
-# starting a second one on a busy port.
-if curl -s -o /dev/null --max-time 2 http://127.0.0.1:8742/api/status; then
-  echo "already running - reopening the page" >> "\$LOG"
-  open "http://127.0.0.1:8742"
-  exit 0
+# The robot venv has the Unitree SDK, so live telemetry works.
+PYBIN="\$DIR/.venv_robot/bin/python"
+[ -x "\$PYBIN" ] || PYBIN="\$HOME/miniconda3/envs/go2/bin/python"
+
+# Start it only if nothing is serving yet. The server is launched in the
+# background and this script exits, rather than exec-ing into it: if the
+# launcher became the server, macOS would consider the app "running" and
+# a second double-click would do nothing at all - not even bring the page
+# to the front.
+if ! curl -s -o /dev/null --max-time 2 "\$URL/api/status"; then
+  GO2_PANEL_NO_OPEN=1 nohup "\$PYBIN" web/server.py >> "\$LOG" 2>&1 &
+  for i in \$(seq 1 40); do
+    curl -s -o /dev/null --max-time 1 "\$URL/api/status" && break
+    sleep 0.25
+  done
+else
+  echo "already running - focusing the existing tab" >> "\$LOG"
 fi
-exec "\$PYBIN" web/server.py >> "\$LOG" 2>&1
+show
 EOF
 finish "$APP"
 
