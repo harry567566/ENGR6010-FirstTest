@@ -1077,6 +1077,20 @@ class Panel:
             bad("The Wi-Fi environment is missing: run  bash lab/setup_wifi_sdk.sh")
             return
         target = wifi_target()
+
+        # The live window holds a connection open, and the dog takes exactly
+        # one Wi-Fi client. A second one does not queue - the dog answers
+        # 429 Too Many Requests and the button simply fails, which is what
+        # happened to 1-5 in the lab.
+        live = [p for p in self.procs
+                if getattr(p, "key", "") == "w_live" and p.poll() is None]
+        if live and key != "m_stop":
+            bad(f"{label}: close the 1-1b live window first - it is holding the dog's one Wi-Fi connection. "
+                f"Its own buttons do stand, balance, sit and stop. "
+                f"/ 先关掉 1-1b 实时窗口:狗只接受一个 Wi-Fi 连接,现在被它占着。"
+                f"站起来/平衡站立/趴下/停止在那个窗口里都有。")
+            return
+
         busy = [p for p in self.procs if getattr(p, "wifi", False) and p.poll() is None]
         if key == "m_stop":
             # end motion commands still running: a walk sends StopMove over its own connection and hangs up,
