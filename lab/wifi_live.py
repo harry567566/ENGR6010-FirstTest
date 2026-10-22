@@ -50,14 +50,21 @@ SPORTSTATE = "rt/lf/sportmodestate"
 CLOUD = "rt/utlidar/voxel_map_compressed"
 POSE = "rt/utlidar/robot_pose"
 
-# Ceilings, not speeds: the sliders choose anything up to these. A key held
-# down is a command repeated twenty times a second, so this is what stands
-# between a slip of the finger and a robot at a run.
-MAX = {"vx": 0.5, "vy": 0.3, "vyaw": 0.8}
+# The slider ceiling depends on the gait, because the gait is what decides
+# whether the dog can take the speed. These are what the gait is asked for,
+# not what it will necessarily do - the dog's own measured velocity is on
+# screen, and that is the number to believe.
+GAITS = {
+    "walk":  {"api": 1061, "name": "慢走",  "vx": 0.6, "vyaw": 0.8},
+    "trot":  {"api": 1019, "name": "普通",  "vx": 1.5, "vyaw": 1.6},
+    "run":   {"api": 1062, "name": "快跑",  "vx": 3.0, "vyaw": 2.0},
+}
+MAX_VY = 0.8
 MOVE_HZ = 20.0
 STANDING_LOCKED = (0, 2, 6, 8)      # Move does little here until BalanceStand
 API = {"damp": 1001, "balance": 1002, "stop": 1003, "stand": 1004,
-       "sit": 1005, "recover": 1006, "move": 1008}
+       "sit": 1005, "recover": 1006, "move": 1008,
+       "walk": 1061, "trot": 1019, "run": 1062, "speed": 1015}
 
 CAM_W, CAM_H = 460, 345
 MAP_PX = 560                        # the map panel is square; metres vary
@@ -71,6 +78,12 @@ GRID_N = int(EXTENT / CELL)
 FLOOR_BAND = (0.25, 2.20)           # metres above the floor that count as
 #                                     structure: below is floor, above is
 #                                     ceiling, and neither draws a wall
+
+# The 3D view keeps its own copy of the cloud, thinned to one point per 8 cm
+# box. Without thinning a few minutes of sweeps is tens of millions of
+# points, almost all of them landing on a pixel another point already owns.
+VOX3 = 0.08
+MAX3 = 400_000
 
 
 class Shared:
@@ -91,6 +104,8 @@ class Shared:
         self.zrange = None
         self.grid = np.zeros((GRID_N, GRID_N), np.uint16)
         self.cells = 0
+        self.pts3 = np.zeros((0, 3), np.float32)    # the 3D view's cloud
+        self.keys3 = np.zeros(0, np.int64)          # its voxel keys, sorted
 
     def put(self, **kw):
         with self.lock:
@@ -102,13 +117,16 @@ class Shared:
             return dict(state=dict(self.state), frame=self.frame,
                         cloud_t=self.cloud_t, pose=self.pose,
                         trail=list(self.trail), counts=dict(self.counts),
-                        note=self.note, zrange=self.zrange, cells=self.cells)
+                        note=self.note, zrange=self.zrange, cells=self.cells,
+                        pts3=self.pts3)
 
     def clear_map(self):
         with self.lock:
             self.grid[:] = 0
             self.cells = 0
             self.trail = []
+            self.pts3 = np.zeros((0, 3), np.float32)
+            self.keys3 = np.zeros(0, np.int64)
 
 
 SH = Shared()
@@ -166,6 +184,34 @@ def fold_into_map(pts):
         SH.cells = int(np.count_nonzero(g))
 
 
+def add_points3(pts):
+    """Keep one point per 8 cm box, for the 3D view.
+
+    Deduplicating with a sorted key array and searchsorted rather than a
+    Python set: twenty thousand points a sweep, fifteen sweeps a second,
+    and a set would spend more time hashing than the renderer spends
+    drawing."""
+    if pts is None or len(pts) < 10:
+        return
+    v = np.floor(pts / VOX3).astype(np.int64)
+    # pack into one integer; the offsets keep every real coordinate positive
+    k = ((v[:, 0] + 2000) * 4000 + (v[:, 1] + 2000)) * 2000 + (v[:, 2] + 500)
+    k, first = np.unique(k, return_index=True)
+    with SH.lock:
+        have = SH.keys3
+        if len(have):
+            pos = np.searchsorted(have, k)
+            pos = np.clip(pos, 0, len(have) - 1)
+            fresh = have[pos] != k
+        else:
+            fresh = np.ones(len(k), bool)
+        if not fresh.any():
+            return
+        new_pts = pts[first[fresh]]
+        SH.pts3 = np.concatenate([SH.pts3, new_pts])[-MAX3:]
+        SH.keys3 = np.union1d(have, k[fresh])
+
+
 async def robot_loop(target):
     conn = await connect(target)
 
@@ -200,6 +246,7 @@ async def robot_loop(target):
         SH.put(cloud_t=time.time())
         SH.counts["cloud"] += 1
         fold_into_map(pts)
+        add_points3(pts)
 
     def on_pose(msg):
         try:
@@ -266,9 +313,10 @@ async def robot_loop(target):
                 DRIVE["cmd"] = None
 
             if cmd:                                 # a button in the window
-                code = await request(conn, API[cmd])
-                SH.put(note=f"{cmd}: {'OK' if code == 0 else code}")
-                if cmd in ("stop", "sit", "damp"):
+                name, param = (cmd if isinstance(cmd, tuple) else (cmd, None))
+                code = await request(conn, API[name], param)
+                SH.put(note=f"{name}: {'OK' if code == 0 else code}")
+                if name in ("stop", "sit", "damp"):
                     moving = False
                 continue
 
@@ -297,11 +345,14 @@ async def robot_loop(target):
         await disconnect(conn)
 
 
-async def request(conn, api_id, timeout=4.0):
+async def request(conn, api_id, parameter=None, timeout=4.0):
+    payload = {"api_id": api_id}
+    if parameter is not None:
+        payload["parameter"] = parameter
     try:
         answer = await asyncio.wait_for(
             conn.datachannel.pub_sub.publish_request_new(
-                SPORT_TOPIC, {"api_id": api_id}), timeout)
+                SPORT_TOPIC, payload), timeout)
         return answer.get("data", {}).get("header", {}) \
                      .get("status", {}).get("code", -1)
     except Exception:
@@ -401,15 +452,127 @@ def render_map(snap, metres, follow=True):
     return Image.fromarray(img)
 
 
+def render_3d(snap, az, el, dist, follow=True, drop_floor=True):
+    """The accumulated cloud from any angle, coloured by height.
+
+    Perspective, drawn with numpy straight into the pixels: four hundred
+    thousand points is nothing as arrays and impossible as canvas items.
+    Painted far-to-near so the nearer surface wins the pixel."""
+    n = MAP_PX
+    img = np.zeros((n, n, 3), np.uint8)
+    img[:, :] = (8, 10, 15)
+
+    pts = snap["pts3"]
+    cx, cy, yaw = snap["pose"]
+    if len(pts) and drop_floor:
+        # The floor is most of the cloud and it reads as a blue carpet with
+        # the room hidden under it. Taking it out leaves the structure,
+        # which is the part worth looking at from an angle.
+        floor = float(np.percentile(pts[:, 2], 3))
+        pts = pts[pts[:, 2] > floor + 0.18]
+    if not len(pts):
+        _draw_hud_3d(img, n, az, el)
+        return Image.fromarray(img)
+
+    centre = np.array([cx, cy, 0.6], np.float32) if follow \
+        else pts.mean(axis=0)
+    p = pts - centre
+
+    ca, sa = math.cos(az), math.sin(az)                 # spin about z
+    x = p[:, 0] * ca + p[:, 1] * sa
+    y = -p[:, 0] * sa + p[:, 1] * ca
+    z = p[:, 2]
+    ce, se = math.cos(el), math.sin(el)                 # then tilt
+    y2 = y * ce - z * se
+    z2 = y * se + z * ce
+
+    depth = y2 + dist                                   # camera down -y
+    ok = depth > 0.35
+    if not ok.any():
+        _draw_hud_3d(img, n, az, el)
+        return Image.fromarray(img)
+    x, z2, depth, hgt = x[ok], z2[ok], depth[ok], z[ok]
+
+    f = n * 0.62
+    sx = (x * f / depth + n / 2).astype(np.int32)
+    sy = (n / 2 - z2 * f / depth).astype(np.int32)
+    vis = (sx >= 0) & (sx < n) & (sy >= 0) & (sy < n)
+    sx, sy, depth, hgt = sx[vis], sy[vis], depth[vis], hgt[vis]
+    if not len(sx):
+        _draw_hud_3d(img, n, az, el)
+        return Image.fromarray(img)
+
+    order = np.argsort(-depth)                          # far first
+    sx, sy, depth, hgt = sx[order], sy[order], depth[order], hgt[order]
+
+    lo, hi = float(hgt.min()), float(hgt.max())
+    u = np.clip((hgt - lo) / max(hi - lo, 0.5), 0, 1)
+    fade = np.clip(1.25 - depth / 26.0, 0.25, 1.0)      # distance haze
+    img[sy, sx, 0] = (fade * (45 + 210 * u)).astype(np.uint8)
+    img[sy, sx, 1] = (fade * (105 + 150 * np.sin(u * math.pi))).astype(np.uint8)
+    img[sy, sx, 2] = (fade * (255 - 150 * u)).astype(np.uint8)
+
+    # the dog, drawn at the middle since the view is centred on it
+    if follow:
+        c = n // 2
+        img[c - 2:c + 3, c - 4:c + 5] = (250, 250, 250)
+
+    _draw_hud_3d(img, n, az, el)
+    return Image.fromarray(img)
+
+
+def _draw_hud_3d(img, n, az, el):
+    img[8:11, 8:8 + 60] = (40, 48, 60)                  # a quiet corner mark
+    img[8:8 + 60, 8:11] = (40, 48, 60)
+
+
 # ---------------------------------------------------------------- the view
 
 DARK, PANEL, INK, DIM = "#0d0f14", "#161a22", "#e8ebf0", "#8891a3"
+LINE, ACCENT, BAD = "#2a313d", "#4da3ff", "#ff5f56"
+
+
+class Btn(tk.Label):
+    """A button that is actually the colour it is told to be.
+
+    On macOS tk.Button is drawn by the system: bg and fg are ignored, so
+    every button came out white-on-white and unreadable. A Label does
+    honour them, and a Label with <Button-1> bound is a button."""
+
+    def __init__(self, parent, text, command, bg=PANEL, fg=INK, bold=False,
+                 pad=(14, 9), **kw):
+        super().__init__(parent, text=text, bg=bg, fg=fg,
+                         font=("Helvetica", 12, "bold" if bold else "normal"),
+                         padx=pad[0], pady=pad[1], cursor="pointinghand",
+                         highlightthickness=1, highlightbackground=LINE, **kw)
+        self._bg, self._cmd = bg, command
+        self.bind("<Button-1>", self._press)
+        self.bind("<ButtonRelease-1>", self._release)
+        self.bind("<Enter>", lambda _e: self.configure(highlightbackground=ACCENT))
+        self.bind("<Leave>", lambda _e: self.configure(bg=self._bg,
+                                                       highlightbackground=LINE))
+
+    def _press(self, _e):
+        self.configure(bg=_lighten(self._bg))
+
+    def _release(self, _e):
+        self.configure(bg=self._bg)
+        self._cmd()
+
+
+def _lighten(hexcol, by=28):
+    r, g, b = (int(hexcol[i:i + 2], 16) for i in (1, 3, 5))
+    return "#%02x%02x%02x" % (min(r + by, 255), min(g + by, 255),
+                              min(b + by, 255))
 
 
 class App:
     def __init__(self, root, target):
         self.root = root
         self.metres = 16.0
+        self.az, self.el, self.dist = -0.6, 0.45, 9.0
+        self._drag_from = None
+        self.keys = set()               # before anything that calls apply()
         self.follow = tk.BooleanVar(value=True)
         root.title(f"Go2 · {target}")
         root.configure(bg=DARK)
@@ -440,24 +603,35 @@ class App:
         right.grid(row=0, column=1, sticky="n")
         head = tk.Frame(right, bg=DARK)
         head.pack(fill="x", pady=(0, 3))
-        tk.Label(head, text="激光雷达地图 · 俯视", fg=INK, bg=DARK,
-                 font=("Helvetica", 12, "bold")).pack(side="left")
+        tk.Label(head, text="激光雷达", fg=INK, bg=DARK,
+                 font=("Helvetica", 12, "bold")).pack(side="left", padx=(0, 8))
+        self.view = "map"
+        self._vbtn = {}
+        for key, name in (("map", "俯视图"), ("3d", "3D"), ("front", "前视")):
+            b = Btn(head, name, lambda k=key: self.set_view(k), pad=(9, 3))
+            b.pack(side="left", padx=2)
+            self._vbtn[key] = b
+        self.floor = tk.BooleanVar(value=False)
+        ttk.Checkbutton(head, text="含地面",
+                        variable=self.floor).pack(side="left", padx=8)
         for txt, fn in (("清空", self.clear), ("+", self.zoom_in),
                         ("−", self.zoom_out)):
-            tk.Button(head, text=txt, command=fn, bg=PANEL, fg=INK,
-                      relief="flat", width=4,
-                      font=("Helvetica", 11)).pack(side="right", padx=2)
+            Btn(head, txt, fn, pad=(10, 3)).pack(side="right", padx=2)
         ttk.Checkbutton(head, text="跟随狗",
                         variable=self.follow).pack(side="right", padx=8)
         self._mblank = ImageTk.PhotoImage(
             Image.new("RGB", (MAP_PX, MAP_PX), (10, 13, 18)))
         self.map = tk.Label(right, bg="#0a0d12", image=self._mblank)
         self.map.pack()
+        # drag to orbit in 3D; the map view ignores it
+        self.map.bind("<Button-1>", self._drag_start)
+        self.map.bind("<B1-Motion>", self._drag)
         self.mapinfo = tk.Label(right, text="", fg=DIM, bg=DARK, anchor="w",
                                 justify="left", font=("Menlo", 10))
         self.mapinfo.pack(fill="x", pady=(5, 0))
 
-        self.keys = set()
+        self.set_view("map")
+        self.set_gait("trot")
         root.bind("<KeyPress>", self.down)
         root.bind("<KeyRelease>", self.up)
         root.protocol("WM_DELETE_WINDOW", self.close)
@@ -466,20 +640,34 @@ class App:
 
     # ------------------------------------------------------------ controls
     def build_controls(self, parent):
+        gait = tk.Frame(parent, bg=DARK)
+        gait.pack(fill="x", pady=(10, 2))
+        tk.Label(gait, text="步态", fg=DIM, bg=DARK,
+                 font=("Helvetica", 11)).pack(side="left", padx=(0, 6))
+        self.gait = "trot"
+        self._gbtn = {}
+        for key, g in GAITS.items():
+            b = Btn(gait, f"{g['name']}  {g['vx']:.1f}", 
+                    lambda k=key: self.set_gait(k), pad=(8, 5))
+            b.pack(side="left", padx=2)
+            self._gbtn[key] = b
+
         box = tk.Frame(parent, bg=DARK)
-        box.pack(fill="x", pady=(10, 0))
+        box.pack(fill="x", pady=(6, 0))
         self.vsp = tk.DoubleVar(value=0.30)
         self.wsp = tk.DoubleVar(value=0.50)
         self._labs = []
+        g = GAITS[self.gait]
         for row, (var, lo, hi, unit, name) in enumerate((
-                (self.vsp, 0.05, MAX["vx"], "m/s", "走路速度"),
-                (self.wsp, 0.10, MAX["vyaw"], "rad/s", "转向速度"))):
+                (self.vsp, 0.05, g["vx"], "m/s", "走路速度"),
+                (self.wsp, 0.10, g["vyaw"], "rad/s", "转向速度"))):
             tk.Label(box, text=name, fg=DIM, bg=DARK,
                      font=("Helvetica", 11)).grid(row=row, column=0,
                                                   sticky="w", pady=2)
-            ttk.Scale(box, from_=lo, to=hi, variable=var, length=200,
-                      command=lambda *_: self.apply()).grid(row=row, column=1,
-                                                            padx=6)
+            sc = ttk.Scale(box, from_=lo, to=hi, variable=var, length=200,
+                           command=lambda *_: self.apply())
+            sc.grid(row=row, column=1, padx=6)
+            setattr(self, "_sc%d" % row, sc)
             lab = tk.Label(box, text="", fg=INK, bg=DARK,
                            font=("Menlo", 11), width=10, anchor="w")
             lab.grid(row=row, column=2, sticky="w")
@@ -496,13 +684,11 @@ class App:
         for text, cmd, colour in (("站起来", "stand", PANEL),
                                   ("平衡站立", "balance", PANEL),
                                   ("趴下", "sit", PANEL),
-                                  ("■ 停止", "stop", "#ff5f56")):
-            tk.Button(btns, text=text, bg=colour, relief="flat",
-                      fg="#ffffff" if colour != PANEL else INK,
-                      font=("Helvetica", 12,
-                            "bold" if cmd == "stop" else "normal"),
-                      command=lambda c=cmd: self.send(c)).pack(
-                          side="left", expand=True, fill="x", padx=2)
+                                  ("■ 停止", "stop", BAD)):
+            Btn(btns, text, lambda c=cmd: self.send(c), bg=colour,
+                fg="#ffffff" if colour != PANEL else INK,
+                bold=(cmd == "stop"), pad=(6, 9)).pack(
+                    side="left", expand=True, fill="x", padx=2)
 
     def send(self, cmd):
         if cmd == "stop":
@@ -510,11 +696,58 @@ class App:
         with drive_lock:
             DRIVE["cmd"] = cmd
 
+    def set_gait(self, key):
+        """Pick the gait, and move the sliders' ceiling with it.
+
+        Asking for 3 m/s in a walking gait does not produce 3 m/s; the gait
+        is what decides. The dog's own measured speed is on screen, and
+        that is the number to trust over anything asked for here."""
+        self.gait = key
+        g = GAITS[key]
+        self._sc0.configure(to=g["vx"])
+        self._sc1.configure(to=g["vyaw"])
+        if self.vsp.get() > g["vx"]:
+            self.vsp.set(g["vx"])
+        if self.wsp.get() > g["vyaw"]:
+            self.wsp.set(g["vyaw"])
+        for k, b in self._gbtn.items():
+            b.configure(bg=(ACCENT if k == key else PANEL),
+                        fg=("#07090d" if k == key else INK))
+            b._bg = ACCENT if k == key else PANEL
+        with drive_lock:
+            DRIVE["cmd"] = key
+        self.apply()
+
+    def set_view(self, key):
+        self.view = key
+        if key == "front":                 # look along the dog's nose
+            self.az, self.el = 0.0, 0.08
+        for k, b in self._vbtn.items():
+            b.configure(bg=(ACCENT if k == key else PANEL),
+                        fg=("#07090d" if k == key else INK))
+            b._bg = ACCENT if k == key else PANEL
+
+    def _drag_start(self, e):
+        self._drag_from = (e.x, e.y, self.az, self.el)
+
+    def _drag(self, e):
+        if self.view == "map" or not self._drag_from:
+            return
+        x0, y0, az0, el0 = self._drag_from
+        self.az = az0 - (e.x - x0) * 0.008
+        self.el = max(-0.25, min(1.45, el0 + (e.y - y0) * 0.008))
+
     def zoom_in(self):
-        self.metres = max(4.0, self.metres / 1.5)
+        if self.view == "map":
+            self.metres = max(4.0, self.metres / 1.5)
+        else:
+            self.dist = max(1.5, self.dist / 1.4)
 
     def zoom_out(self):
-        self.metres = min(70.0, self.metres * 1.5)
+        if self.view == "map":
+            self.metres = min(70.0, self.metres * 1.5)
+        else:
+            self.dist = min(80.0, self.dist * 1.4)
 
     def clear(self):
         SH.clear_map()
@@ -554,7 +787,7 @@ class App:
         k, v, w = self.keys, self.vsp.get(), self.wsp.get()
         with drive_lock:
             DRIVE.update(vx=v * (("w" in k) - ("s" in k)),
-                         vy=min(v, MAX["vy"]) * (("a" in k) - ("d" in k)),
+                         vy=min(v, MAX_VY) * (("a" in k) - ("d" in k)),
                          vyaw=w * (("q" in k) - ("e" in k)))
 
     def close(self):
@@ -569,8 +802,13 @@ class App:
         if s["frame"] is not None:
             self._cam = ImageTk.PhotoImage(s["frame"])
             self.cam.configure(image=self._cam)
-        self._map = ImageTk.PhotoImage(
-            render_map(s, self.metres, self.follow.get()))
+        if self.view == "map":
+            pic = render_map(s, self.metres, self.follow.get())
+        else:
+            az = self.az + (s["pose"][2] if self.view == "front" else 0.0)
+            pic = render_3d(s, az, self.el, self.dist, self.follow.get(),
+                            drop_floor=not self.floor.get())
+        self._map = ImageTk.PhotoImage(pic)
         self.map.configure(image=self._map)
 
         for lab, var, unit in self._labs:
@@ -593,8 +831,10 @@ class App:
 
         age = time.time() - s["cloud_t"] if s["cloud_t"] else None
         zr = s["zrange"]
+        where = (f"视野 {self.metres:.0f} m" if self.view == "map"
+                 else f"距离 {self.dist:.0f} m · 拖动旋转 · {len(s['pts3']):,} 点")
         self.mapinfo.configure(text=(
-            f"视野 {self.metres:.0f} m   地图 {s['cells']:,} 格   "
+            f"{where}   地图 {s['cells']:,} 格   "
             + (f"点云 {age:.1f} s 前" if age is not None else "等待点云") + "\n"
             + (f"本帧 {zr[3]:,}/{zr[4]:,} 点算作墙   "
                f"高度 {zr[0]:+.2f} ~ {zr[1]:+.2f} m  (地面 {zr[2]:+.2f})"
