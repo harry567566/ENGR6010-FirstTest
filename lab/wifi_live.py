@@ -95,6 +95,10 @@ API = {"damp": 1001, "balance": 1002, "stop": 1003, "stand": 1004,
 
 CAM_W, CAM_H = 460, 345
 MAP_PX = 560                        # the map panel is square; metres vary
+MAP_MAX = 720                       # above this the redraw costs more than
+#                                     the extra pixels are worth, and the
+#                                     cost lands on the thread that reads
+#                                     the keyboard
 
 # 6 cm cells over 80 m: a teaching building with room to spare, and fine
 # enough that a wall is two or three cells thick.
@@ -521,7 +525,7 @@ async def robot_loop(target):
 
     SH.put(note="connected")
 
-    last_sent, moving = 0.0, False
+    last_sent, moving, last_balance = 0.0, False, 0.0
     period = 1.0 / MOVE_HZ
     try:
         while True:
@@ -575,15 +579,22 @@ async def robot_loop(target):
                 vx = vy = vyaw = 0.0
 
             if vx or vy or vyaw:
-                if SH.state.get("mode") in STANDING_LOCKED and not moving:
+                if (SH.state.get("mode") in STANDING_LOCKED and not moving
+                        and time.time() - last_balance > 2.0):
                     # Move does almost nothing from idle stand, so switch
-                    # first - the same thing 1-7 does
-                    await request(conn, API["balance"])
-                    SH.put(note="balance stand")
+                    # first - but fire and forget. Awaiting the reply here
+                    # stalled the whole drive loop for up to four seconds,
+                    # and a drive loop that stops for four seconds is a
+                    # robot that ignores the keyboard.
+                    last_balance = time.time()
+                    asyncio.create_task(request(conn, API["balance"]))
+                    slog("→ balance stand")
                 send_move(conn, vx, vy, vyaw, avoid=DRIVE["avoid"])
                 moving, last_sent = True, time.time()
             elif moving and time.time() - last_sent > 0.12:
-                await request(conn, API["stop"])
+                # also fire and forget: StopMove must go out now, not when
+                # the dog gets round to answering
+                asyncio.create_task(request(conn, API["stop"]))
                 moving = False
     except asyncio.CancelledError:
         pass
@@ -1053,11 +1064,22 @@ class App:
         self.fov, self.ofsx, self.ofsy = 1.0, 0.0, 0.0
         self._drag_from = None
         self.keys = set()
+        self._krelease = {}
         self.cam_size = (CAM_W, CAM_H)
         self.map_size = MAP_PX
         self._logn = -1
         root.configure(bg=DARK)
-        root.minsize(900, 620)
+        root.minsize(860, 600)
+        # An explicit size, and small enough to fit any laptop screen. The
+        # panels have weight and the content does not, so without this the
+        # window opened at whatever the widgets added up to - which with a
+        # 560 px map and a camera beside it was most of the display.
+        try:
+            sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
+            w, h = min(1240, int(sw * 0.72)), min(820, int(sh * 0.76))
+            root.geometry(f"{w}x{h}+{(sw - w) // 2}+{max(20, (sh - h) // 3)}")
+        except Exception:
+            root.geometry("1240x820")
 
         root.rowconfigure(1, weight=1)
         root.columnconfigure(0, weight=3, uniform="col")
@@ -1161,6 +1183,9 @@ class App:
         self.log.grid(row=5, column=0, sticky="ew")
         self.log.configure(state="disabled")
 
+        self._last_map = 0.0
+        self._last_cam = 0.0
+        self._map_sig = None
         self.set_view("map")
         self.set_gait("trot")
         self.set_keep(30)
@@ -1427,12 +1452,33 @@ class App:
             return self.zoom_in()
         if k == "minus":
             return self.zoom_out()
-        if k in "wasdqe":
+        if k not in "wasdqe" or not k:
+            return
+        # Cancel a pending release: macOS auto-repeat sends KeyRelease and
+        # KeyPress over and over while a key is held down, so taking the
+        # key out on every release makes a held key stutter - which is
+        # exactly what driving felt like.
+        h = self._krelease.pop(k, None)
+        if h:
+            self.root.after_cancel(h)
+        if k not in self.keys:
             self.keys.add(k)
             self.apply()
 
     def up(self, e):
         k = (e.keysym or "").lower()
+        if k not in self.keys:
+            return
+        h = self._krelease.pop(k, None)
+        if h:
+            self.root.after_cancel(h)
+        # A real release is one that is not followed by a repeat within the
+        # repeat interval. 70 ms is comfortably longer than that and still
+        # far shorter than anyone can notice when letting go.
+        self._krelease[k] = self.root.after(70, lambda kk=k: self._let_go(kk))
+
+    def _let_go(self, k):
+        self._krelease.pop(k, None)
         if k in self.keys:
             self.keys.discard(k)
             self.apply()
@@ -1468,30 +1514,47 @@ class App:
         s = SH.snap()
         st, c = s["state"], s["counts"]
 
+        now = time.time()
         cw, ch = self.cam_size
-        if s["frame"] is not None and cw > 20 and ch > 20:
+        if (s["frame"] is not None and cw > 20 and ch > 20
+                and now - self._last_cam > 0.10):
+            self._last_cam = now
             im = s["frame"].copy()
             im.thumbnail((cw, ch))
             self._cam = ImageTk.PhotoImage(im)
             self.cam.configure(image=self._cam)
 
-        n = self.map_size
-        extra = None
-        if self.view == "map":
-            pic = render_map(s, self.metres, self.follow.get(), n=n)
-        elif self.view == "fuse":
-            fv = {k: v[0].get() for k, v in self.fuse_vars.items()}
-            pic, extra = render_overlay(s, n=n, dx=fv["ofsx"], dy=fv["ofsy"],
-                                        fov=fv["fov"])
-            for name, (v, lab) in self.fuse_vars.items():
-                lab.configure(text=f"{t(name)} {v.get():.0f}"
-                              if name != "fov" else f"{t(name)} {v.get():.2f}")
-        else:
-            az = self.az + (s["pose"][2] if self.view == "front" else 0.0)
-            pic = render_3d(s, az, self.el, self.dist, self.follow.get(),
-                            drop_floor=not self.floor.get(), n=n)
-        self._map = ImageTk.PhotoImage(pic)
-        self.map.configure(image=self._map)
+        # Drawing is the expensive thing in this window and it happens on
+        # the same thread as the key handling, so a big panel redrawn as
+        # fast as possible starves the keyboard - which is what made
+        # driving feel broken. Cap the pixels, cap the rate, and skip
+        # entirely when nothing that shows has changed.
+        n = min(self.map_size, MAP_MAX)
+        sig = (self.view, round(self.metres, 2), round(self.az, 2),
+               round(self.el, 2), round(self.dist, 1), n,
+               s["cloud_t"], s["slam_n"], len(s["trail"]),
+               self.follow.get(), self.floor.get())
+        due = now - self._last_map > 0.12
+        extra = getattr(self, "_extra", None)
+        if due and sig != self._map_sig:
+            self._map_sig, self._last_map = sig, now
+            if self.view == "map":
+                pic = render_map(s, self.metres, self.follow.get(), n=n)
+            elif self.view == "fuse":
+                fv = {k: v[0].get() for k, v in self.fuse_vars.items()}
+                pic, extra = render_overlay(s, n=n, dx=fv["ofsx"],
+                                            dy=fv["ofsy"], fov=fv["fov"])
+                for name, (v, lab) in self.fuse_vars.items():
+                    lab.configure(
+                        text=f"{t(name)} {v.get():.0f}" if name != "fov"
+                        else f"{t(name)} {v.get():.2f}")
+            else:
+                az = self.az + (s["pose"][2] if self.view == "front" else 0.0)
+                pic = render_3d(s, az, self.el, self.dist, self.follow.get(),
+                                drop_floor=not self.floor.get(), n=n)
+            self._map = ImageTk.PhotoImage(pic)
+            self.map.configure(image=self._map)
+            self._extra = extra
 
         for _nm, val, var, unit, _k in self._labs:
             val.configure(text=f"{var.get():.2f} {unit}")
@@ -1547,7 +1610,7 @@ class App:
             self.log.insert("1.0", "\n".join(slog[-6:]))
             self.log.configure(state="disabled")
 
-        self.root.after(60, self.tick)
+        self.root.after(40, self.tick)
 
 def set_icon(root):
     """A dog on the Dock and in the title bar, drawn rather than shipped.
@@ -1587,6 +1650,23 @@ def wifi_target():
         return "ap"
 
 
+def quiet_library_noise():
+    """Silence one traceback the library prints on every connection.
+
+    future_resolver.run_resolve_for_topic calls future.set_result on a
+    future that is sometimes already resolved, and logs the whole
+    InvalidStateError. It is harmless and it is not ours to fix, but it
+    buries the lines that do matter."""
+    import logging
+
+    class Drop(logging.Filter):
+        def filter(self, rec):
+            return "invalid state" not in str(rec.exc_info or rec.msg).lower()
+
+    logging.getLogger().addFilter(Drop())
+    logging.getLogger("aiortc.codecs.h264").setLevel(logging.ERROR)
+
+
 def main():
     # --dds <iface> drives the window over DDS: the simulator in the VM, or
     # the real dog on the cable. Without it, WebRTC over the dog's Wi-Fi.
@@ -1598,6 +1678,7 @@ def main():
         args = args[:i] + args[i + 2:]
     target = args[0] if args else wifi_target()
 
+    quiet_library_noise()
     loop = asyncio.new_event_loop()
     task = {}
 
