@@ -175,17 +175,36 @@ drive_lock = threading.Lock()
 # --------------------------------------------------------------- the robot
 
 def decode_cloud(data):
-    """The voxel decoder's output -> (N, 3) float32 metres.
+    """Whatever the decoder produced -> (N, 3) float32 metres.
 
-    `positions` is raw bytes: three float32 per point. The count that
-    matters is face_count; point_count is voxels before expansion."""
+    There are two decoders in the library and they do NOT return the same
+    thing, which is the bug that made the cloud useless:
+
+        native   {"points": (N,3)}   already metres - the last line of
+                 bits_to_points is `points * resolution + origin`
+        libvoxel {"positions": ...}  VOXEL INDICES, not metres. They have
+                 to be multiplied by the message's resolution and offset by
+                 its origin, or the cloud comes out twenty times too big
+                 (resolution is usually 0.05) and in the wrong place.
+
+    The panel asks for the native decoder, so the first branch is the one
+    that runs; the second is here because the default is libvoxel and a
+    silent twenty-fold error is not worth risking again."""
     try:
+        pts = data.get("points")
+        if pts is not None:
+            xyz = np.asarray(pts, dtype=np.float32).reshape(-1, 3)
+            return np.ascontiguousarray(xyz[np.isfinite(xyz).all(axis=1)])
+
         pos = data.get("positions")
         n = int(data.get("face_count", 0))
         if pos is None or n <= 0:
             return None
         xyz = np.frombuffer(bytes(pos), dtype=np.float32)[:n * 3]
-        xyz = xyz.reshape(-1, 3)
+        xyz = xyz.reshape(-1, 3).astype(np.float32)
+        res = float(data.get("resolution", 0.05))
+        org = np.asarray(data.get("origin", (0.0, 0.0, 0.0)), np.float32)
+        xyz = xyz * res + org
         return np.ascontiguousarray(xyz[np.isfinite(xyz).all(axis=1)])
     except Exception:
         return None
@@ -326,15 +345,18 @@ async def robot_loop(target):
             except Exception:
                 pass            # a dropped frame is not worth stopping for
 
+    def slog(text):
+        with SH.lock:
+            SH.slog.append(f"{time.strftime('%H:%M:%S')}  {text}")
+            del SH.slog[:-80]
+
     def on_slog(msg):
         try:
             txt = str(msg["data"]["data"] if isinstance(msg["data"], dict)
                       else msg["data"])
         except Exception:
             return
-        with SH.lock:
-            SH.slog.append(txt)
-            del SH.slog[:-40]
+        slog("← " + txt)
         SH.put(note=txt[:60])
 
     def on_slam_cloud(msg):
@@ -362,6 +384,12 @@ async def robot_loop(target):
     # Without this the dog throttles the cloud away, and a plain subscribe
     # looks exactly like a LiDAR that is not running.
     try:
+        # native, not the default libvoxel: it returns points in metres
+        # instead of voxel indices, so there is no scale to get wrong
+        conn.datachannel.set_decoder("native")
+    except Exception as e:
+        SH.put(note=f"decoder: {e}")
+    try:
         await conn.datachannel.disableTrafficSaving(True)
     except Exception as e:
         SH.put(note=f"traffic saving: {e}")
@@ -372,6 +400,15 @@ async def robot_loop(target):
         conn.video.switchVideoChannel(True)
     except Exception as e:
         SH.put(note=f"camera unavailable: {e}")
+
+    # The LiDAR has to be running before any of the SLAM commands do
+    # anything: the mapping frontend's inputs are the lidar topics, and a
+    # mapping/start with the LiDAR off succeeds and then publishes nothing.
+    try:
+        ps.publish_without_callback("rt/utlidar/switch", "ON")
+        slog("→ rt/utlidar/switch ON")
+    except Exception as e:
+        slog(f"lidar switch: {e}")
 
     SH.put(note="connected")
 
@@ -389,7 +426,20 @@ async def robot_loop(target):
                 # a plain string on its own topic, no envelope, no reply
                 text = cmd[6:]
                 ps.publish_without_callback(USLAM_CMD, text)
-                SH.put(note=f"→ {text}")
+                slog("→ " + text)
+                # Ask straight back. If uslam is not running nothing will
+                # answer, and silence then means something rather than
+                # being indistinguishable from a button that did nothing.
+                ns = text.split("/")[0]
+                if ns in ("mapping", "localization", "navigation", "patrol"):
+                    await asyncio.sleep(0.4)
+                    ps.publish_without_callback(USLAM_CMD,
+                                                f"{ns}/get_status")
+                continue
+
+            if cmd == "lidar_on":
+                ps.publish_without_callback("rt/utlidar/switch", "ON")
+                slog("→ rt/utlidar/switch ON")
                 continue
 
             if cmd == "avoid_on" or cmd == "avoid_off":
@@ -399,15 +449,15 @@ async def robot_loop(target):
                         AVOID_TOPIC, {"api_id": AVOID["on"],
                                       "parameter": json.dumps(
                                           {"enable": want})}), 4.0)
-                    SH.put(note=f"避障 {'开' if want else '关'}")
+                    slog(f"← 避障 {'开' if want else '关'}")
                 except Exception as e:
-                    SH.put(note=f"避障: {e}")
+                    slog(f"避障失败: {e}")
                 continue
 
             if cmd:                                 # a button in the window
                 name, param = (cmd if isinstance(cmd, tuple) else (cmd, None))
                 code = await request(conn, API[name], param)
-                SH.put(note=f"{name}: {'OK' if code == 0 else code}")
+                slog(f"← {name}: {'OK' if code == 0 else code}")
                 if name in ("stop", "sit", "damp"):
                     moving = False
                 continue
@@ -854,7 +904,16 @@ class App:
         self.map.bind("<Double-Button-1>", self.click_map)
         self.mapinfo = tk.Label(right, text="", fg=DIM, bg=DARK, anchor="w",
                                 justify="left", font=("Menlo", 10))
-        self.mapinfo.pack(fill="x", pady=(5, 0))
+        self.mapinfo.pack(fill="x", pady=(5, 2))
+
+        # Every command and every reply, so a button that appears to do
+        # nothing can be told apart from one whose reply nobody showed.
+        self.log = tk.Text(right, height=7, bg="#07090d", fg="#b9c1cf",
+                           font=("Menlo", 10), relief="flat", wrap="none",
+                           highlightthickness=1, highlightbackground=LINE)
+        self.log.pack(fill="x")
+        self.log.configure(state="disabled")
+        self._logn = 0
 
         self.set_view("map")
         self.set_gait("trot")
@@ -917,6 +976,8 @@ class App:
         Btn(row1, "跟着我", lambda: self.send("follow"),
             pad=(10, 4)).pack(side="right", padx=2)
         Btn(row1, "自己走", lambda: self.send("freeavoid"),
+            pad=(10, 4)).pack(side="right", padx=2)
+        Btn(row1, "开雷达", lambda: self.send("lidar_on"),
             pad=(10, 4)).pack(side="right", padx=2)
 
         row2 = tk.Frame(smart, bg=DARK); row2.pack(fill="x", pady=2)
@@ -1120,6 +1181,14 @@ class App:
             + (f"本帧 {zr[3]:,}/{zr[4]:,} 点算作墙   "
                f"高度 {zr[0]:+.2f} ~ {zr[1]:+.2f} m  (地面 {zr[2]:+.2f})"
                if zr else "高度范围:还没有点云")))
+        lines = s.get("slog") or []
+        if len(lines) != self._logn:
+            self._logn = len(lines)
+            self.log.configure(state="normal")
+            self.log.delete("1.0", "end")
+            self.log.insert("1.0", "\n".join(lines[-7:]))
+            self.log.configure(state="disabled")
+
         self.root.after(60, self.tick)
 
 
