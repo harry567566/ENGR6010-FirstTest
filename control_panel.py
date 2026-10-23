@@ -144,6 +144,24 @@ ACTIONS = [
            "(Wi-Fi:检查 Mac 是否连着狗的 Wi-Fi、狗有没有回应。虚拟机备用路线:重启一次虚拟机,给它加一张"
            "接网线的网卡,再在 Ubuntu 里做同样的事,地址用 192.168.123.223。)"),
           say="The Go2 is at 192.168.123.161 on its own wired network, so my computer joins that network first."),
+        A("w_map", "mac", [WIFI_PY, os.path.join(LAB, "go2_map.py"), "--probe"],
+          ("1-0  What can this dog do? (the whole reference)",
+           "Prints every topic, every motion api_id, the obstacle-avoidance service and the on-board SLAM "
+           "command set, each marked cable or Wi-Fi - then connects over Wi-Fi and asks the robot which "
+           "services it is running and which topics actually publish. Sends no motion command.",
+           "A long reference in the output box, then the dog's own service list and an eight-second count of "
+           "which topics are alive.",
+           "The reference is generated from the installed library's tables, so it cannot drift away from the "
+           "code that will be called. Which route each thing is on is what decides what is possible: joint-level "
+           "control and anything carried from simulation is DDS, so it is cable only."),
+          ("1-0  这只狗到底能做什么(总册)",
+           "把所有话题、所有运动 api_id、避障服务、板载 SLAM 命令全部列出来,每一项标明走网线还是 Wi-Fi;"
+           "然后连上狗,问它自己在跑哪些服务、哪些话题真的在发(听 8 秒)。不发任何运动命令。",
+           "输出框里一份长长的总册,后面跟着狗自己报的服务列表和话题存活计数。",
+           "总册是从装好的库的表里自动生成的,不会和将来要调的代码脱节。"
+           "每项标的那条路决定了什么做得到:关节级控制、以及任何从仿真搬过来的东西,都是 DDS,只能走网线。"),
+          limit=40,
+          say="Everything the robot exposes, in one place, with which connection each thing needs."),
         A("w_live", "mac_window", [WIFI_PY, os.path.join(LAB, "wifi_live.py")],
           ("1-1b  Live view over Wi-Fi: camera, LiDAR, WASD",
            "Opens one window that holds a SINGLE Wi-Fi connection and shows the front camera, the LiDAR "
