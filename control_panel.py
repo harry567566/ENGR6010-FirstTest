@@ -180,6 +180,23 @@ ACTIONS = [
            "点云确实能走 Wi-Fi 拿到 —— 不是 DDS(DDS 确实只能走网线),而是狗自己的 WebRTC 通道,"
            "手机 App 画地图用的就是它。"),
           say="One Wi-Fi connection, held open, carrying the camera, the LiDAR and the keyboard at the same time."),
+        A("w_live_dds", "mac_window", [ROBOT_PY, os.path.join(LAB, "wifi_live.py"), "--dds", "AUTO"],
+          ("1-1c  Live view over the CABLE (DDS)",
+           "The same window as 1-1b, driven over DDS on the Ethernet card instead of WebRTC over Wi-Fi. "
+           "Read-only: it shows state and the deskewed point cloud, and sends nothing. This is also the route "
+           "the MuJoCo simulator speaks, so the same window will show the simulated dog once the VM's network "
+           "is bridged - which is the whole point of rehearsing in simulation.",
+           "The same panels. No camera over this route; the cloud is rt/utlidar/cloud_deskewed.",
+           "DDS is the only route to rt/lowcmd, so anything trained in simulation comes back through here. "
+           "A window that reads DDS reads the simulator and the real robot with one set of code."),
+          ("1-1c  实时画面(网线 / DDS)",
+           "和 1-1b 同一个窗口,但走网线上的 DDS,不是 Wi-Fi 的 WebRTC。只读:显示状态和去畸变点云,不发任何命令。"
+           "MuJoCo 仿真器说的也是这条协议,所以等虚拟机网络桥接好,同一个窗口就能显示仿真狗 —— 这正是先在仿真里"
+           "排练的意义。",
+           "界面一模一样。这条路没有摄像头;点云用的是 rt/utlidar/cloud_deskewed。",
+           "DDS 是通往 rt/lowcmd 的唯一一条路,所以仿真里训出来的东西要回到真狗身上,只能走这里。"
+           "一个会读 DDS 的窗口,用同一套代码同时能看仿真狗和真狗。"),
+          say="The same window over the cable, which is also what the simulator speaks."),
         R("r_state", ("real_state.py", "10"),
           ("1-2  Read robot state (safe)", "Listens to the robot's messages for 10 s. Sends nothing, so the robot "
            "does not move.", "Battery voltage, body tilt, body height, leg angles, foot forces, message rate.",
@@ -978,6 +995,17 @@ class Panel:
             for p in self.procs:
                 if p.kind == "mac_window" and p.poll() is None:
                     p.terminate()
+            if "AUTO" in (a.get("cmd") or []):
+                # the DDS window needs the card that is on the dog's wired
+                # network, and which one that is only becomes true after 1-1
+                iface = mac_robot_iface()
+                if not iface:
+                    self.write("  no 192.168.123.x card: click 1-1 first "
+                               "(cable route) / 没有 192.168.123.x 网卡:"
+                               "先用网线路线点 1-1。", "bad")
+                    return
+                a = dict(a, cmd=[iface if c == "AUTO" else c
+                                 for c in a["cmd"]])
         if a["where"] == "vm":
             if a.get("show_vm"):  # the simulator draws on the Ubuntu desktop, which is the UTM window
                 subprocess.Popen(["osascript", "-e", 'tell application "UTM" to activate'])
