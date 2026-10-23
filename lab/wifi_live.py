@@ -45,6 +45,31 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from wifi_common import connect, disconnect                 # noqa: E402
 
 SPORT_TOPIC = "rt/api/sport/request"
+AVOID_TOPIC = "rt/api/obstacles_avoid/request"
+# The dog's own obstacle avoidance. MOVE here is the same velocity command
+# as the sport one, except the robot is allowed to refuse the parts of it
+# that would walk into something. Switching it on and driving through this
+# topic is the whole of "don't hit the wall" - none of it is ours to write.
+AVOID = {"on": 1001, "get": 1002, "move": 1003, "remote": 1004}
+
+# The robot's own SLAM. rt/uslam/client_command takes a PLAIN STRING -
+# "mapping/start", "navigation/set_goal_pose/1.250/-0.400/1.571" - not the
+# api_id envelope every other topic uses, and it must go out through
+# publish_without_callback: publish() waits on a future keyed to a uuid dug
+# out of the payload, and a bare string has none, so it never returns.
+USLAM_CMD = "rt/uslam/client_command"
+USLAM_LOG = "rt/uslam/server_log"
+USLAM_CLOUD = "rt/uslam/frontend/cloud_world_ds"
+USLAM_ODOM = "rt/uslam/frontend/odom"
+USLAM_LOC_ODOM = "rt/uslam/localization/odom"
+USLAM_PATH = "rt/uslam/navigation/global_path"
+
+# Go2 front camera, from Go2Py's calibration note (640 x 480). The WebRTC
+# stream is 1280 x 720, a different aspect, so this is scaled by width and
+# the vertical centre is taken from the frame - good enough to see whether
+# the mount is right, not good enough to publish. The overlay view exists
+# to judge exactly this.
+FX, FY, CX, CY = 379.7099, 379.3696, 320.3064, 243.1175
 LOWSTATE = "rt/lf/lowstate"
 SPORTSTATE = "rt/lf/sportmodestate"
 CLOUD = "rt/utlidar/voxel_map_compressed"
@@ -64,7 +89,9 @@ MOVE_HZ = 20.0
 STANDING_LOCKED = (0, 2, 6, 8)      # Move does little here until BalanceStand
 API = {"damp": 1001, "balance": 1002, "stop": 1003, "stand": 1004,
        "sit": 1005, "recover": 1006, "move": 1008,
-       "walk": 1061, "trot": 1019, "run": 1062, "speed": 1015}
+       "walk": 1061, "trot": 1019, "run": 1062, "speed": 1015,
+       "follow": 2056,            # LeadFollow - the dog's own person-follow
+       "freeavoid": 2048}         # FreeAvoid  - walk and dodge by itself
 
 CAM_W, CAM_H = 460, 345
 MAP_PX = 560                        # the map panel is square; metres vary
@@ -96,6 +123,9 @@ class Shared:
         self.lock = threading.Lock()
         self.state = {}
         self.frame = None
+        self.raw = None              # the camera frame as an array, for the
+        self.raw_t = 0.0             # overlay; the PIL one is for the label
+        self.cloud = None            # the newest sweep, un-accumulated
         self.cloud_t = 0.0
         self.pose = (0.0, 0.0, 0.0)
         self.trail = []
@@ -106,6 +136,11 @@ class Shared:
         self.cells = 0
         self.pts3 = np.zeros((0, 3), np.float32)    # the 3D view's cloud
         self.keys3 = np.zeros(0, np.int64)          # its voxel keys, sorted
+        self.slam = None             # the dog's own SLAM map, (N, 3)
+        self.slam_n = 0
+        self.path = None             # the planner's route, (N, 2)
+        self.goal = None
+        self.slog = []               # what the SLAM server says
 
     def put(self, **kw):
         with self.lock:
@@ -118,7 +153,9 @@ class Shared:
                         cloud_t=self.cloud_t, pose=self.pose,
                         trail=list(self.trail), counts=dict(self.counts),
                         note=self.note, zrange=self.zrange, cells=self.cells,
-                        pts3=self.pts3)
+                        pts3=self.pts3, cloud=self.cloud, raw=self.raw,
+                        slam=self.slam, slam_n=self.slam_n, path=self.path,
+                        goal=self.goal, slog=list(self.slog))
 
     def clear_map(self):
         with self.lock:
@@ -130,7 +167,8 @@ class Shared:
 
 
 SH = Shared()
-DRIVE = {"vx": 0.0, "vy": 0.0, "vyaw": 0.0, "allowed": False, "cmd": None}
+DRIVE = {"vx": 0.0, "vy": 0.0, "vyaw": 0.0, "allowed": False, "cmd": None,
+         "avoid": False}
 drive_lock = threading.Lock()
 
 
@@ -214,6 +252,12 @@ def add_points3(pts):
 
 async def robot_loop(target):
     conn = await connect(target)
+    slam_dec = None
+    try:
+        from slam_decoder import SlamDecoder
+        slam_dec = SlamDecoder()
+    except Exception as e:
+        SH.put(note=f"slam decoder: {e}")
 
     def on_low(msg):
         try:
@@ -243,7 +287,7 @@ async def robot_loop(target):
         pts = decode_cloud(msg.get("data", {}).get("data", {}))
         if pts is None or not len(pts):
             return
-        SH.put(cloud_t=time.time())
+        SH.put(cloud=pts, cloud_t=time.time())
         SH.counts["cloud"] += 1
         fold_into_map(pts)
         add_points3(pts)
@@ -276,12 +320,41 @@ async def robot_loop(target):
                 box = Image.new("RGB", (CAM_W, CAM_H), (7, 9, 13))
                 box.paste(img, ((CAM_W - img.width) // 2,
                                 (CAM_H - img.height) // 2))
-                SH.put(frame=box)
+                SH.put(frame=box, raw=frame.to_ndarray(format="rgb24"),
+                       raw_t=time.time())
                 SH.counts["frame"] += 1
             except Exception:
                 pass            # a dropped frame is not worth stopping for
 
+    def on_slog(msg):
+        try:
+            txt = str(msg["data"]["data"] if isinstance(msg["data"], dict)
+                      else msg["data"])
+        except Exception:
+            return
+        with SH.lock:
+            SH.slog.append(txt)
+            del SH.slog[:-40]
+        SH.put(note=txt[:60])
+
+    def on_slam_cloud(msg):
+        if slam_dec is None:
+            return
+        d = msg.get("data", {})
+        whole, _frame = slam_dec.decode(d.get("data", b""), d)
+        if whole is None or not len(whole):
+            return
+        SH.put(slam=whole, slam_n=len(whole))
+
+    def on_path(msg):
+        pts = parse_pointcloud2(msg.get("data", {}))
+        if pts is not None and len(pts):
+            SH.put(path=pts[:, :2])
+
     ps = conn.datachannel.pub_sub
+    ps.subscribe(USLAM_LOG, on_slog)
+    ps.subscribe(USLAM_CLOUD, on_slam_cloud)
+    ps.subscribe(USLAM_PATH, on_path)
     ps.subscribe(LOWSTATE, on_low)
     ps.subscribe(SPORTSTATE, on_sport)
     ps.subscribe(POSE, on_pose)
@@ -312,6 +385,25 @@ async def robot_loop(target):
                 allowed, cmd = DRIVE["allowed"], DRIVE["cmd"]
                 DRIVE["cmd"] = None
 
+            if isinstance(cmd, str) and cmd.startswith("uslam:"):
+                # a plain string on its own topic, no envelope, no reply
+                text = cmd[6:]
+                ps.publish_without_callback(USLAM_CMD, text)
+                SH.put(note=f"→ {text}")
+                continue
+
+            if cmd == "avoid_on" or cmd == "avoid_off":
+                want = cmd == "avoid_on"
+                try:
+                    await asyncio.wait_for(ps.publish_request_new(
+                        AVOID_TOPIC, {"api_id": AVOID["on"],
+                                      "parameter": json.dumps(
+                                          {"enable": want})}), 4.0)
+                    SH.put(note=f"避障 {'开' if want else '关'}")
+                except Exception as e:
+                    SH.put(note=f"避障: {e}")
+                continue
+
             if cmd:                                 # a button in the window
                 name, param = (cmd if isinstance(cmd, tuple) else (cmd, None))
                 code = await request(conn, API[name], param)
@@ -329,7 +421,7 @@ async def robot_loop(target):
                     # first - the same thing 1-7 does
                     await request(conn, API["balance"])
                     SH.put(note="balance stand")
-                send_move(conn, vx, vy, vyaw)
+                send_move(conn, vx, vy, vyaw, avoid=DRIVE["avoid"])
                 moving, last_sent = True, time.time()
             elif moving and time.time() - last_sent > 0.12:
                 await request(conn, API["stop"])
@@ -359,8 +451,48 @@ async def request(conn, api_id, parameter=None, timeout=4.0):
         return -1
 
 
-def send_move(conn, vx, vy, vyaw):
-    """Fire and forget, the shape wifi_sport.py sends."""
+def parse_pointcloud2(d):
+    """sensor_msgs/PointCloud2 -> (N, 3) float32, offsets read from the msg.
+
+    The navigation path and the localisation cloud arrive as plain
+    PointCloud2 rather than anything compressed."""
+    try:
+        fields = {f["name"]: f for f in d["fields"]}
+        if not all(k in fields for k in ("x", "y", "z")):
+            return None
+        step = int(d["point_step"])
+        raw = np.frombuffer(bytes(d["data"]), np.uint8)
+        n = len(raw) // step
+        if n == 0:
+            return None
+        raw = raw[:n * step].reshape(n, step)
+        out = np.empty((n, 3), np.float32)
+        for i, k in enumerate(("x", "y", "z")):
+            off = int(fields[k]["offset"])
+            out[:, i] = raw[:, off:off + 4].copy().view(np.float32).ravel()
+        return out[np.isfinite(out).all(axis=1)]
+    except Exception:
+        return None
+
+
+def send_move(conn, vx, vy, vyaw, avoid=False):
+    """Fire and forget, the shape wifi_sport.py sends.
+
+    With `avoid` the same velocity goes to the obstacle-avoidance service
+    instead, which is free to refuse the part of it that would walk into
+    something. That refusal is the whole of "do not hit the wall", and it
+    is the robot's, not ours."""
+    if avoid:
+        conn.datachannel.pub_sub.publish_without_callback(AVOID_TOPIC, {
+            "header": {"identity": {"id": int(time.time() * 1000) % 2147483648
+                                          + random.randint(0, 1000),
+                                    "api_id": AVOID["move"]},
+                       "policy": {"priority": 0, "noreply": True}},
+            "parameter": json.dumps({"x": vx, "y": vy, "yaw": vyaw,
+                                     "mode": 0}),
+            "binary": [],
+        })
+        return
     conn.datachannel.pub_sub.publish_without_callback(SPORT_TOPIC, {
         "header": {"identity": {"id": int(time.time() * 1000) % 2147483648
                                       + random.randint(0, 1000),
@@ -427,6 +559,33 @@ def render_map(snap, metres, follow=True):
 
     def to_px(x, y):
         return (int((x - cx) * ppm + n / 2), int(n / 2 - (y - cy) * ppm))
+
+    # The dog's own SLAM map, when it is running: this is what the phone
+    # app draws, and it is better than anything folded together out here.
+    sl = snap.get("slam")
+    if sl is not None and len(sl):
+        lo = float(np.percentile(sl[:, 2], 3))
+        keep = (sl[:, 2] > lo + FLOOR_BAND[0]) & (sl[:, 2] < lo + FLOOR_BAND[1])
+        w2 = sl[keep]
+        if len(w2):
+            sxp = ((w2[:, 0] - cx) * ppm + n / 2).astype(np.int32)
+            syp = (n / 2 - (w2[:, 1] - cy) * ppm).astype(np.int32)
+            v = (sxp >= 0) & (sxp < n) & (syp >= 0) & (syp < n)
+            img[syp[v], sxp[v]] = (120, 240, 190)
+
+    for i in range(1, len(snap.get("path") or [])):     # the planner's route
+        x0, y0 = to_px(*snap["path"][i - 1])
+        x1, y1 = to_px(*snap["path"][i])
+        for t in np.linspace(0, 1, 8):
+            qx, qy = int(x0 + (x1 - x0) * t), int(y0 + (y1 - y0) * t)
+            if 0 <= qx < n - 1 and 0 <= qy < n - 1:
+                img[qy:qy + 2, qx:qx + 2] = (255, 215, 90)
+
+    if snap.get("goal"):                                # where it was sent
+        gx, gy = to_px(*snap["goal"])
+        if 2 <= gx < n - 3 and 2 <= gy < n - 3:
+            img[gy - 3:gy + 4, gx - 1:gx + 2] = (90, 255, 140)
+            img[gy - 1:gy + 2, gx - 3:gx + 4] = (90, 255, 140)
 
     trail = snap["trail"]
     for i in range(1, len(trail)):                     # where it has been
@@ -526,6 +685,71 @@ def _draw_hud_3d(img, n, az, el):
     img[8:8 + 60, 8:11] = (40, 48, 60)
 
 
+def render_overlay(snap):
+    """The current sweep drawn on the camera picture, coloured by range.
+
+    This is the fusion of the two sensors, and it is also the only honest
+    way to judge the mount: if the points land on the walls and the floor
+    in the picture, the extrinsics are right; if they sit an arm's length
+    off, they are not, and no amount of colouring a cloud will fix it.
+
+    The cloud's frame is worked out from the data rather than assumed - a
+    sweep centred on the robot's odometry position is in the odom frame, a
+    sweep centred on nothing in particular is already in the body frame."""
+    raw, pts = snap["raw"], snap["cloud"]
+    if raw is None:
+        img = np.zeros((CAM_H, CAM_W, 3), np.uint8)
+        img[:, :] = (7, 9, 13)
+        return Image.fromarray(img), "等待摄像头"
+    img = raw.copy()
+    h, w = img.shape[:2]
+    if pts is None or not len(pts):
+        return Image.fromarray(img), "等待点云"
+
+    cx_o, cy_o, yaw = snap["pose"]
+    mid = pts[:, :2].mean(axis=0)
+    in_odom = math.dist(mid, (cx_o, cy_o)) < math.hypot(*mid) * 0.6 + 1.5
+    if in_odom:
+        d = pts[:, :2] - np.array([cx_o, cy_o], np.float32)
+        c, sn = math.cos(-yaw), math.sin(-yaw)
+        body = np.stack([d[:, 0] * c - d[:, 1] * sn,
+                         d[:, 0] * sn + d[:, 1] * c,
+                         pts[:, 2]], 1)
+    else:
+        body = pts
+
+    # camera axes: +z forward, +x right, +y down; lidar: +x fwd, +y left, +z up
+    X, Y, Z = -body[:, 1], -body[:, 2], body[:, 0]
+    front = Z > 0.25
+    if not front.any():
+        return Image.fromarray(img), "点都在身后"
+    X, Y, Z, rng = X[front], Y[front], Z[front], Z[front]
+    sc = w / 640.0
+    u = (FX * sc * X / Z + w / 2).astype(np.int32)
+    v = (FY * sc * Y / Z + h / 2).astype(np.int32)
+    ok = (u >= 1) & (u < w - 1) & (v >= 1) & (v < h - 1)
+    u, v, rng = u[ok], v[ok], rng[ok]
+    if not len(u):
+        return Image.fromarray(img), "点云不在画面里"
+
+    t = np.clip(rng / 8.0, 0, 1)                    # near red, far blue
+    r = (255 * (1 - t)).astype(np.uint8)
+    g = (90 + 110 * np.sin(t * math.pi)).astype(np.uint8)
+    b = (60 + 195 * t).astype(np.uint8)
+    for dy in (-1, 0, 1):                           # 3x3 so they read
+        for dx in (-1, 0, 1):
+            img[v + dy, u + dx, 0] = r
+            img[v + dy, u + dx, 1] = g
+            img[v + dy, u + dx, 2] = b
+
+    out = Image.fromarray(img)
+    out.thumbnail((MAP_PX, MAP_PX))
+    pad = Image.new("RGB", (MAP_PX, MAP_PX), (8, 10, 15))
+    pad.paste(out, (0, (MAP_PX - out.height) // 2))
+    return pad, (f"{len(u):,} 点落在画面上 · "
+                 f"坐标系 {'odom(已转到机身)' if in_odom else '机身'} · 近红远蓝")
+
+
 # ---------------------------------------------------------------- the view
 
 DARK, PANEL, INK, DIM = "#0d0f14", "#161a22", "#e8ebf0", "#8891a3"
@@ -607,7 +831,8 @@ class App:
                  font=("Helvetica", 12, "bold")).pack(side="left", padx=(0, 8))
         self.view = "map"
         self._vbtn = {}
-        for key, name in (("map", "俯视图"), ("3d", "3D"), ("front", "前视")):
+        for key, name in (("map", "俯视图"), ("3d", "3D"), ("front", "前视"),
+                          ("fuse", "相机+雷达")):
             b = Btn(head, name, lambda k=key: self.set_view(k), pad=(9, 3))
             b.pack(side="left", padx=2)
             self._vbtn[key] = b
@@ -626,6 +851,7 @@ class App:
         # drag to orbit in 3D; the map view ignores it
         self.map.bind("<Button-1>", self._drag_start)
         self.map.bind("<B1-Motion>", self._drag)
+        self.map.bind("<Double-Button-1>", self.click_map)
         self.mapinfo = tk.Label(right, text="", fg=DIM, bg=DARK, anchor="w",
                                 justify="left", font=("Menlo", 10))
         self.mapinfo.pack(fill="x", pady=(5, 0))
@@ -679,8 +905,30 @@ class App:
                         variable=self.allow,
                         command=self.on_allow).pack(fill="x", pady=(10, 5))
 
+        smart = tk.Frame(parent, bg=DARK)
+        smart.pack(fill="x", pady=(10, 4))
+        tk.Label(smart, text="狗自己的本事", fg=DIM, bg=DARK,
+                 font=("Helvetica", 11)).pack(anchor="w")
+        row1 = tk.Frame(smart, bg=DARK); row1.pack(fill="x", pady=2)
+        self.avoid = tk.BooleanVar(value=False)
+        ttk.Checkbutton(row1, text="避障(走路时自己绕开)",
+                        variable=self.avoid,
+                        command=self.on_avoid).pack(side="left")
+        Btn(row1, "跟着我", lambda: self.send("follow"),
+            pad=(10, 4)).pack(side="right", padx=2)
+        Btn(row1, "自己走", lambda: self.send("freeavoid"),
+            pad=(10, 4)).pack(side="right", padx=2)
+
+        row2 = tk.Frame(smart, bg=DARK); row2.pack(fill="x", pady=2)
+        for text, cmd in (("开始建图", "mapping/start"),
+                          ("结束建图", "mapping/stop"),
+                          ("定位", "localization/start"),
+                          ("导航", "navigation/start")):
+            Btn(row2, text, lambda c=cmd: self.uslam(c), pad=(7, 4)).pack(
+                side="left", expand=True, fill="x", padx=1)
+
         btns = tk.Frame(parent, bg=DARK)
-        btns.pack(fill="x")
+        btns.pack(fill="x", pady=(6, 0))
         for text, cmd, colour in (("站起来", "stand", PANEL),
                                   ("平衡站立", "balance", PANEL),
                                   ("趴下", "sit", PANEL),
@@ -695,6 +943,33 @@ class App:
             self.stop()
         with drive_lock:
             DRIVE["cmd"] = cmd
+
+    def uslam(self, text):
+        """One of the robot's own SLAM commands, as a plain string."""
+        with drive_lock:
+            DRIVE["cmd"] = "uslam:" + text
+
+    def on_avoid(self):
+        on = bool(self.avoid.get())
+        with drive_lock:
+            DRIVE["avoid"] = on
+            DRIVE["cmd"] = "avoid_on" if on else "avoid_off"
+
+    def click_map(self, e):
+        """Click the floor plan to send the dog there.
+
+        Only in the map view, and only with motion allowed - a click is
+        very easy to make by accident, and this one walks a robot across a
+        building."""
+        if self.view != "map" or not self.allow.get():
+            return
+        s = SH.snap()
+        cx, cy = s["pose"][:2] if self.follow.get() else (0.0, 0.0)
+        ppm = MAP_PX / self.metres
+        gx = cx + (e.x - MAP_PX / 2) / ppm
+        gy = cy - (e.y - MAP_PX / 2) / ppm
+        SH.put(goal=(gx, gy))
+        self.uslam(f"navigation/set_goal_pose/{gx:.3f}/{gy:.3f}/0.000")
 
     def set_gait(self, key):
         """Pick the gait, and move the sliders' ceiling with it.
@@ -802,8 +1077,11 @@ class App:
         if s["frame"] is not None:
             self._cam = ImageTk.PhotoImage(s["frame"])
             self.cam.configure(image=self._cam)
+        extra = ""
         if self.view == "map":
             pic = render_map(s, self.metres, self.follow.get())
+        elif self.view == "fuse":
+            pic, extra = render_overlay(s)
         else:
             az = self.az + (s["pose"][2] if self.view == "front" else 0.0)
             pic = render_3d(s, az, self.el, self.dist, self.follow.get(),
@@ -832,9 +1110,12 @@ class App:
         age = time.time() - s["cloud_t"] if s["cloud_t"] else None
         zr = s["zrange"]
         where = (f"视野 {self.metres:.0f} m" if self.view == "map"
+                 else extra if self.view == "fuse"
                  else f"距离 {self.dist:.0f} m · 拖动旋转 · {len(s['pts3']):,} 点")
+        slam_bit = (f"狗的SLAM {s['slam_n']:,} 点   " if s.get("slam_n")
+                    else "")
         self.mapinfo.configure(text=(
-            f"{where}   地图 {s['cells']:,} 格   "
+            f"{where}   {slam_bit}地图 {s['cells']:,} 格   "
             + (f"点云 {age:.1f} s 前" if age is not None else "等待点云") + "\n"
             + (f"本帧 {zr[3]:,}/{zr[4]:,} 点算作墙   "
                f"高度 {zr[0]:+.2f} ~ {zr[1]:+.2f} m  (地面 {zr[2]:+.2f})"
